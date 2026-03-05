@@ -194,7 +194,7 @@ class AudioEncoder:
     self.proj2 = nn.Linear(d_model, output_dim)
 
   def _conv_stem(self, mel: np.ndarray) -> tuple[Tensor, int]:
-    """Conv stem + positional embeddings. Returns (tensor, seq_len)."""
+    """Conv stem + positional embeddings. Returns (tensor, seq_len). Python-loop fallback."""
     total_frames = mel.shape[1]
     chunk_outputs = []
     for start in range(0, total_frames, self.chunk_size):
@@ -220,7 +220,47 @@ class AudioEncoder:
       offset += cl
     return Tensor.cat(*chunks_with_pos, dim=0).realize(), seq_len
 
+  def _encode_batched(self, mel_tensor: Tensor) -> Tensor:
+    """Full encoder as single tensor graph (JIT-friendly, no Python loops).
+    mel_tensor: [128, padded_frames] where padded_frames is multiple of chunk_size.
+    Handles multi-window attention by treating windows as batch dimension.
+    Returns [seq_len, output_dim]."""
+    n_chunks = mel_tensor.shape[1] // self.chunk_size
+    tokens_per_chunk = 13  # 100 mel frames through 3x stride-2 conv → 13 time steps
+    tokens_per_window = tokens_per_chunk * (self.n_window_infer // self.chunk_size)  # 104
+    n_windows = (n_chunks * tokens_per_chunk + tokens_per_window - 1) // tokens_per_window
+
+    # Batch conv stem: reshape [128, N*100] → [N, 1, 128, 100], process all chunks at once
+    mel_4d = mel_tensor.reshape(NUM_MEL_BINS, n_chunks, self.chunk_size).permute(1, 0, 2)
+    mel_4d = mel_4d.reshape(n_chunks, 1, NUM_MEL_BINS, self.chunk_size)
+    x = self.conv3(self.conv2(self.conv1(mel_4d).gelu()).gelu()).gelu()  # [N, 480, 16, 13]
+    x = x.permute(0, 3, 1, 2).reshape(n_chunks * tokens_per_chunk, -1)  # [N*13, 480*16]
+    x = self.conv_out(x)  # [N*13, d_model]
+
+    # Sinusoidal position embeddings (same per chunk, broadcast add)
+    pos = _sinusoidal_pos_emb(tokens_per_chunk, self.d_model)
+    x = (x.reshape(n_chunks, tokens_per_chunk, self.d_model) + pos.unsqueeze(0)).reshape(-1, self.d_model)
+
+    # Transformer with windowed attention: reshape to [n_windows, tokens_per_window, d_model]
+    # All windows are the same size, so we use batch dimension for parallel attention
+    seq = tokens_per_window  # 104 tokens per window
+    x = x.reshape(n_windows, seq, self.d_model)
+    for block in self.blk:
+      h = block.attn_norm(x)
+      q = block.attn_q(h).reshape(n_windows, seq, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+      k = block.attn_k(h).reshape(n_windows, seq, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+      v = block.attn_v(h).reshape(n_windows, seq, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+      attn = q.scaled_dot_product_attention(k, v, is_causal=False).permute(0, 2, 1, 3).reshape(n_windows, seq, self.n_heads * self.head_dim)
+      x = x + block.attn_out(attn)
+      h = block.ffn_norm(x)
+      x = x + block.ffn_down(block.ffn_up(h).gelu())
+
+    x = x.reshape(n_windows * seq, self.d_model)
+    x = self.ln_post(x)
+    return self.proj2(self.proj1(x).gelu())
+
   def _transformer(self, x: Tensor, cu_seqlens: list[int]) -> Tensor:
+    """Non-JIT transformer path (multi-window fallback)."""
     for block in self.blk: x = block(x, self.n_heads, self.head_dim, cu_seqlens)
     x = self.ln_post(x)
     return self.proj2(self.proj1(x).gelu()).realize()
@@ -230,15 +270,14 @@ class AudioEncoder:
 
     Pads mel to fixed bucket boundaries (multiples of bucket_frames) so the JIT
     sees a small number of unique graph shapes and caches them effectively.
+    Uses JIT'd batched path for single-window buckets (≤800 frames).
     """
     actual_frames = mel.shape[1]
-    # Bucket: pad to next multiple of 800 frames (~8s). Gives ~4 buckets for typical audio.
-    bucket_frames = self.chunk_size * 8  # 800 frames
+    bucket_frames = self.chunk_size * 8  # 800 frames per bucket
     padded_frames = ((actual_frames + bucket_frames - 1) // bucket_frames) * bucket_frames
     if padded_frames > actual_frames:
       mel = np.pad(mel, ((0, 0), (0, padded_frames - actual_frames)), mode='constant')
 
-    x, seq_len = self._conv_stem(mel)
     tokens_per_chunk = 13  # 100 frames through 3x stride-2
 
     # Compute actual token count (before padding)
@@ -247,10 +286,17 @@ class AudioEncoder:
     tail = actual_frames % self.chunk_size
     if tail > 0: actual_tokens += max(1, tail // 8)
 
-    tokens_per_window = tokens_per_chunk * (self.n_window_infer // self.chunk_size)
-    cu_seqlens = list(range(0, seq_len, tokens_per_window)) + [seq_len]
-    if cu_seqlens[-2] == cu_seqlens[-1]: cu_seqlens = cu_seqlens[:-1]
-    out = self._transformer(x, cu_seqlens)
+    # JIT'd batched path (separate JIT per bucket size, each compiles once)
+    if hasattr(self, '_encode_jits'):
+      if padded_frames not in self._encode_jits:
+        self._encode_jits[padded_frames] = TinyJit(self._encode_batched)
+      mel_tensor = Tensor(mel).contiguous()
+      out = self._encode_jits[padded_frames](mel_tensor)
+      return out[:actual_tokens]
+
+    # Non-JIT fallback
+    mel_tensor = Tensor(mel).contiguous()
+    out = self._encode_batched(mel_tensor)
     return out[:actual_tokens]
 
 # ============================================================================
@@ -343,16 +389,21 @@ class ASR:
     model._prefix_embeds = decoder.token_embd(Tensor(PROMPT_PREFIX)).realize()
     model._suffix_embeds = decoder.token_embd(Tensor(PROMPT_SUFFIX)).realize()
 
+    # Dict of encoder JITs keyed by bucket size (each bucket compiles once)
+    encoder._encode_jits = {}
+
     return model
 
   def warmup(self):
     """Exercise all JIT paths so subsequent calls are fast.
-    Needs 2-3 prefill calls with different sizes to compile @function variants."""
+    Needs 2-3 calls with different sizes to compile @function variants."""
     stderr_log("warming up JIT...\n")
     dim = self._embed_buf.shape[2]
-    # Encoder warmup (one bucket size)
-    dummy_mel = np.zeros((128, 800), dtype=np.float32)
-    self.encoder.forward(dummy_mel)
+    # Encoder JIT warmup: exercise primary bucket sizes (800, 1600)
+    # 2-3 calls per bucket to compile @function variants
+    for bucket in [800, 1600]:
+      for _ in range(3):
+        self.encoder.forward(np.zeros((128, bucket), dtype=np.float32)).realize()
     # Prefill warmup: 3 different sizes to exercise @function compilation
     for nt in [200, 100, 150]:
       self._embed_buf[:, :nt].assign(Tensor.randn(1, nt, dim).contiguous()).realize()
