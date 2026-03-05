@@ -107,6 +107,18 @@ saved = (out1[:,:2] + 0).realize()          # ✅ independent copy
 
 ---
 
+## Decoder KV cache reuse across streaming chunks
+
+**Problem:** Streaming mode re-prefilled the entire prompt from `start_pos=0` every chunk. For a 16s file with 2 cached encoder windows, each chunk prefills ~200+ tokens even though only ~30 change (the partial tail + suffix).
+
+**Solution:** After building each chunk's prompt embeddings, compare row-by-row with the previous chunk's embeddings (saved as numpy). Find the longest matching prefix (reuse point). Only prefill the delta tokens from `start_pos=reuse_point`. The decoder's KV cache already retains entries from the previous chunk — positions 0..reuse_point have valid cached values.
+
+**Why embedding comparison instead of analytical reuse:** The reuse point could be computed analytically (prefix + cached windows are always identical). But embedding comparison is simpler, handles all edge cases (window eviction, bucket changes), and matches the C implementation's approach. The CPU readback cost (~1ms) is negligible vs prefill savings (~150ms).
+
+**Result:** Streaming RTF 0.22 → 0.16 (JFK), 0.232 → 0.194 (30-utt). 245 tokens reused across 6 chunks for JFK 11s. WER unchanged.
+
+---
+
 ## Performance summary (RTX 3070 Laptop, 0.6B model, JFK 11s)
 
 | Stage | No JIT | + Decoder JIT | + JITBEAM=2 | + Encoder JIT | C impl |
@@ -116,3 +128,11 @@ saved = (out1[:,:2] + 0).realize()          # ✅ independent copy
 | Decode | 689ms | 689ms | **229ms** | 264ms | 552ms |
 | **Total** | 2846ms | 2846ms | 1178ms | **591ms** | 783ms |
 | RTF | 0.26 | 0.26 | 0.107 | **0.054** | 0.07 |
+
+**Streaming (JFK 11s, 6 chunks):**
+
+| Metric | Before KV reuse | After KV reuse |
+|--------|----------------|---------------|
+| RTF | 0.22 | **0.16** |
+| Prefill total | ~1200ms | ~800ms |
+| KV tokens reused | 0 | 245 |

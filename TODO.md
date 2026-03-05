@@ -2,7 +2,7 @@
 
 ## Performance
 
-- **Decoder KV cache reuse across streaming chunks.** Currently each streaming chunk re-prefills from `start_pos=0`. The C implementation compares encoder embeddings to find a reuse point, only re-prefilling new tokens. Could save ~200ms/chunk.
+- ~~**Decoder KV cache reuse across streaming chunks.**~~ Done — 245 tokens reused for JFK 11s, streaming RTF 0.22 → 0.16.
 - **Larger streaming chunks.** Test 4s or 8s `chunk_sec` to reduce encoder/prefill/decode cycles per file. Tradeoff: higher latency for first text output.
 - **Encoder partial-tail caching.** The partial tail (audio beyond the last complete 8s window) is re-encoded from scratch every chunk. Could cache and extend instead.
 - **Pre-warm more encoder buckets.** New bucket sizes (e.g. 2400 frames for ~20s audio) trigger JIT compilation on first encounter (~3-4s hit). Could pre-warm common sizes during startup.
