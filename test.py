@@ -347,6 +347,28 @@ if __name__ == "__main__":
                                                  check_perf=args.perf, verbose=args.verbose))
       print(results[-1].summary())
 
+  # --- Disk cache info ---
+  print(f"\n--- Disk cache ---")
+  try:
+    import sqlite3
+    from tinygrad.helpers import CACHEDB
+    if os.path.exists(CACHEDB):
+      db_size_mb = os.path.getsize(CACHEDB) / 1024 / 1024
+      conn = sqlite3.connect(CACHEDB, timeout=5)
+      cur = conn.cursor()
+      tables = cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+      for t in tables:
+        name = t[0]
+        count = cur.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+        val_mb = (cur.execute(f'SELECT SUM(LENGTH(val)) FROM "{name}"').fetchone()[0] or 0) / 1024 / 1024
+        print(f"  {name}: {count} entries, {val_mb:.0f} MB")
+      conn.close()
+      print(f"  DB file: {db_size_mb:.0f} MB")
+    else:
+      print(f"  No cache DB found at {CACHEDB}")
+  except Exception as e:
+    print(f"  Cache info unavailable: {e}")
+
   # --- Summary ---
   total = len(results)
   passed = sum(1 for r in results if r.passed)
