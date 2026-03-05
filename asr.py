@@ -287,6 +287,13 @@ class ASR:
     for p in params: p.replace(p.contiguous())
     Tensor.realize(*params)
 
+    # Add JIT'd forward_embed for ASR prefill (bypasses tok_embeddings)
+    def forward_embed(h: Tensor, start_pos: int|UOp) -> Tensor:
+      for block in decoder.blk: h = block(h, start_pos)
+      return decoder.output(decoder.output_norm(h))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+    decoder.forward_embed = forward_embed
+    decoder.prefill_embed_jit = TinyJit(forward_embed)
+
     # --- Tokenizer ---
     tok = SimpleTokenizer.from_gguf_kv(kv)
 
@@ -314,12 +321,10 @@ class ASR:
     combined = Tensor.cat(prefix_embeds, audio_embeds, suffix_embeds, dim=0).reshape(1, -1, audio_embeds.shape[1])  # [1, prompt_len, dim]
     prompt_len = combined.shape[1]
 
-    # 4. Prefill: run all prompt embeddings through decoder, bypassing tok_embeddings
+    # 4. Prefill: run all prompt embeddings through decoder via JIT'd forward_embed
     t_prefill = time.time()
-    x = combined
-    for block in self.decoder.blk: x = block(x, 0)
-    logits = self.decoder.output(self.decoder.output_norm(x))  # [1, prompt_len, vocab]
-    token = int(logits[0, -1].softmax(-1).argmax(-1).item())
+    out = self.decoder.prefill_embed_jit(combined, 0)
+    token = int(out.item())
     stderr_log(f"prefill: {prompt_len} in {(time.time()-t_prefill)*1000:.0f}ms  {colored('--', 'BLACK')}  ")
 
     # 5. Autoregressive decode using Transformer's standard forward path
