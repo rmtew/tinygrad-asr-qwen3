@@ -287,12 +287,14 @@ class AudioEncoder:
     if tail > 0: actual_tokens += max(1, tail // 8)
 
     # JIT'd batched path (separate JIT per bucket size, each compiles once)
+    # (+0).realize() forces a fresh buffer copy — JIT reuses output buffers,
+    # so callers caching encoder outputs (streaming) need independent copies
     if hasattr(self, '_encode_jits'):
       if padded_frames not in self._encode_jits:
         self._encode_jits[padded_frames] = TinyJit(self._encode_batched)
       mel_tensor = Tensor(mel).contiguous()
       out = self._encode_jits[padded_frames](mel_tensor)
-      return out[:actual_tokens]
+      return (out[:actual_tokens] + 0).realize()
 
     # Non-JIT fallback
     mel_tensor = Tensor(mel).contiguous()
