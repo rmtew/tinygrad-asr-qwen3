@@ -498,10 +498,15 @@ class ASR:
     enc_cache: list[Tensor] = []
     next_window_start = 0  # sample index of next full window boundary
 
+    # KV cache reuse: save previous chunk's prompt embeddings for comparison
+    prev_embeds: np.ndarray | None = None  # [prev_prompt_len, dim] numpy
+    prev_prompt_len = 0
+
     audio_cursor = 0
     chunk_idx = 0
     last_text = ""
     total_enc_ms, total_prefill_ms, total_decode_ms = 0.0, 0.0, 0.0
+    total_reused_tokens = 0
 
     while audio_cursor < len(audio):
       audio_cursor = min(audio_cursor + chunk_samples, len(audio))
@@ -547,15 +552,45 @@ class ASR:
       enc_ms = (time.time() - t_enc) * 1000
       total_enc_ms += enc_ms
 
-      # --- Prefill: [prompt_prefix] + [audio_embeds] + [prompt_suffix] ---
+      # --- Prefill with KV cache reuse ---
+      # Compare current embeddings with previous chunk to find reuse point.
+      # Positions 0..reuse_point have identical KV cache entries — skip them.
       t_pf = time.time()
       combined = Tensor.cat(self._prefix_embeds, audio_embeds, self._suffix_embeds, dim=0).reshape(1, -1, dim)
       prompt_len = combined.shape[1]
       assert prompt_len <= self._embed_buf.shape[1], f"prompt_len {prompt_len} > max_context"
+
+      # Write full embeddings to buffer (needed for both reuse comparison and prefill)
       self._embed_buf[:, :prompt_len].assign(combined.contiguous()).realize()
-      sp_b, nt_b = self.v_sp.bind(0), self.v_nt.bind(prompt_len)
-      out = self.decoder.prefill_embed_jit(self._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
-      token = int(out.item())
+      cur_embeds = self._embed_buf[0, :prompt_len].numpy()  # [prompt_len, dim]
+
+      # Find longest matching prefix with previous chunk
+      reuse_point = 0
+      if prev_embeds is not None:
+        cmp_len = min(prompt_len, prev_prompt_len)
+        row_bytes = dim * 4  # float32
+        for i in range(cmp_len):
+          if not np.array_equal(cur_embeds[i], prev_embeds[i]): break
+          reuse_point = i + 1
+
+      # Prefill only the delta tokens (from reuse_point to prompt_len)
+      delta = prompt_len - reuse_point
+      if delta > 0:
+        sp_b, nt_b = self.v_sp.bind(reuse_point), self.v_nt.bind(delta)
+        out = self.decoder.prefill_embed_jit(self._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
+        token = int(out.item())
+      else:
+        # Entire prompt is unchanged — just re-decode from the last prefill output
+        # (This shouldn't happen in practice since at least the partial tail changes)
+        sp_b, nt_b = self.v_sp.bind(0), self.v_nt.bind(prompt_len)
+        out = self.decoder.prefill_embed_jit(self._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
+        token = int(out.item())
+
+      # Save embeddings for next chunk's comparison
+      prev_embeds = cur_embeds.copy()
+      prev_prompt_len = prompt_len
+      total_reused_tokens += reuse_point
+
       prefill_ms = (time.time() - t_pf) * 1000
       total_prefill_ms += prefill_ms
 
@@ -584,7 +619,8 @@ class ASR:
     rtf = (total_ms / 1000) / audio_sec if audio_sec > 0 else 0
     stderr_log(f"stream: {audio_sec:.1f}s audio, {chunk_idx} chunks, "
                f"enc={total_enc_ms:.0f}ms, prefill={total_prefill_ms:.0f}ms, "
-               f"decode={total_decode_ms:.0f}ms, total={total_ms:.0f}ms, RTF={rtf:.2f}\n")
+               f"decode={total_decode_ms:.0f}ms, total={total_ms:.0f}ms, RTF={rtf:.2f}, "
+               f"kv_reused={total_reused_tokens}\n")
 
     return {"text": last_text, "elapsed_ms": total_ms, "audio_sec": audio_sec, "rtf": rtf}
 
