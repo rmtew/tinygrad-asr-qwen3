@@ -417,21 +417,19 @@ class ASR:
     return {"text": text, "elapsed_ms": (time.time() - t0) * 1000}
 
   def transcribe_stream(self, audio: np.ndarray, chunk_sec: float = 2.0,
-                         rollback: int = 5, max_new_tokens: int = 32,
-                         max_enc_windows: int = 4, max_prefix_tokens: int = 150,
+                         max_new_tokens: int = 64, max_enc_windows: int = 4,
                          callback = None) -> dict:
     """Streaming transcription: process audio in fixed-size chunks.
 
-    Like antirez's C streaming: fixed encoder windows → cached, sliding decoder
-    context with prefix rollback. All shapes are fixed → JIT compiles once.
+    Each chunk encodes all audio heard so far (caching completed encoder windows)
+    and produces a COMPLETE transcription. The last chunk's output is the final result.
+    Intermediate results are delivered via callback for incremental display.
 
     Args:
       audio: float32 mono 16kHz samples
       chunk_sec: seconds of audio per processing step (default 2.0)
-      rollback: tokens to roll back between chunks for boundary stability
       max_new_tokens: max tokens decoded per chunk
       max_enc_windows: sliding window limit for encoder cache
-      max_prefix_tokens: max previously-decoded tokens fed as prefix
       callback: optional fn(text_so_far, is_final) called after each chunk
 
     Returns: {"text": str, "elapsed_ms": float, "audio_sec": float, "rtf": float}
@@ -443,21 +441,13 @@ class ASR:
     enc_window_frames = 800  # 8s of audio per encoder window
     enc_window_samples = enc_window_frames * HOP_LENGTH
 
-    # Reuse cached prompt token embeddings
-    prefix_tok_embeds = self._prefix_embeds
-    suffix_tok_embeds = self._suffix_embeds
-
-    # Encoder window cache: list of (enc_output_tensor, n_tokens)
-    enc_cache: list[tuple[Tensor, int]] = []
+    # Encoder window cache: list of Tensor (realized encoder outputs for complete windows)
+    enc_cache: list[Tensor] = []
     next_window_start = 0  # sample index of next full window boundary
 
-    # Decoded token history
-    raw_tokens: list[int] = []
     audio_cursor = 0
     chunk_idx = 0
-
-    # Reuse shared symbolic variables for JIT stability
-
+    last_text = ""
     total_enc_ms, total_prefill_ms, total_decode_ms = 0.0, 0.0, 0.0
 
     while audio_cursor < len(audio):
@@ -472,62 +462,42 @@ class ASR:
       while next_window_start < full_end:
         ws = next_window_start
         window_mel = compute_mel(audio[ws:ws + enc_window_samples])
-        # Pad to bucket so all complete windows have identical shape
         bucket = self.encoder.chunk_size * 8
         padded = ((window_mel.shape[1] + bucket - 1) // bucket) * bucket
         if padded > window_mel.shape[1]:
           window_mel = np.pad(window_mel, ((0, 0), (0, padded - window_mel.shape[1])))
-        enc_out = self.encoder.forward(window_mel[:, :padded])
-        # Trim padding tokens
-        actual_tokens = enc_window_frames // 8  # ~100 tokens per 800 frames
-        enc_cache.append((enc_out[:actual_tokens].realize(), actual_tokens))
+        enc_out = self.encoder.forward(window_mel[:, :padded]).realize()
+        actual_tokens = enc_window_frames // 8
+        enc_cache.append(enc_out[:actual_tokens])
         next_window_start += enc_window_samples
 
       # Encode partial tail (from last full window boundary to audio_cursor)
       partial_enc = None
-      partial_tokens = 0
       if full_end < audio_cursor:
-        partial_samples = audio_cursor - full_end
         partial_mel = compute_mel(audio[int(full_end):audio_cursor])
-        # Pad to same bucket as full windows
         bucket = self.encoder.chunk_size * 8
         padded = ((partial_mel.shape[1] + bucket - 1) // bucket) * bucket
         if padded > partial_mel.shape[1]:
           partial_mel = np.pad(partial_mel, ((0, 0), (0, padded - partial_mel.shape[1])))
-        partial_out = self.encoder.forward(partial_mel[:, :padded])
-        actual_partial = max(1, partial_mel.shape[1] // 8)  # approximate
-        partial_enc = partial_out[:actual_partial].realize()
-        partial_tokens = actual_partial
+        partial_out = self.encoder.forward(partial_mel[:, :padded]).realize()
+        actual_partial = max(1, (audio_cursor - int(full_end)) // HOP_LENGTH // 8)
+        partial_enc = partial_out[:actual_partial]
 
-      # Evict old encoder windows
+      # Evict old encoder windows (sliding window for long audio)
       while len(enc_cache) > max_enc_windows:
         enc_cache.pop(0)
 
-      # Concatenate encoder outputs
-      enc_parts = [e for e, _ in enc_cache]
-      if partial_enc is not None: enc_parts.append(partial_enc)
-      if not enc_parts:
-        chunk_idx += 1
-        continue
+      # Concatenate encoder outputs: cached windows + partial tail
+      enc_parts = list(enc_cache) + ([partial_enc] if partial_enc is not None else [])
+      if not enc_parts: chunk_idx += 1; continue
       audio_embeds = Tensor.cat(*enc_parts, dim=0) if len(enc_parts) > 1 else enc_parts[0]
-      n_audio_tokens = audio_embeds.shape[0]
       enc_ms = (time.time() - t_enc) * 1000
       total_enc_ms += enc_ms
 
-      # --- Build prefill: [prompt_prefix] [audio] [prompt_suffix] [past_text_tokens] ---
+      # --- Prefill: [prompt_prefix] + [audio_embeds] + [prompt_suffix] ---
       t_pf = time.time()
-      n_text_prefix = min(max(len(raw_tokens) - rollback, 0), max_prefix_tokens)
-      text_prefix_ids = raw_tokens[len(raw_tokens) - n_text_prefix:] if n_text_prefix > 0 else []
-
-      parts = [prefix_tok_embeds, audio_embeds, suffix_tok_embeds]
-      if text_prefix_ids:
-        parts.append(self.decoder.token_embd(Tensor(text_prefix_ids)))
-      combined = Tensor.cat(*parts, dim=0).reshape(1, -1, dim)
+      combined = Tensor.cat(self._prefix_embeds, audio_embeds, self._suffix_embeds, dim=0).reshape(1, -1, dim)
       prompt_len = combined.shape[1]
-
-      # KV cache: start_pos=0 overwrites old positions; causal mask prevents reading stale data
-
-      # Single-call prefill through JIT (shared buffer and variables with transcribe)
       assert prompt_len <= self._embed_buf.shape[1], f"prompt_len {prompt_len} > max_context"
       self._embed_buf[:, :prompt_len].assign(combined.contiguous()).realize()
       sp_b, nt_b = self.v_sp.bind(0), self.v_nt.bind(prompt_len)
@@ -536,7 +506,7 @@ class ASR:
       prefill_ms = (time.time() - t_pf) * 1000
       total_prefill_ms += prefill_ms
 
-      # --- Decode up to max_new_tokens ---
+      # --- Decode until EOS or max_new_tokens ---
       t_dec = time.time()
       chunk_tokens = [token]
       for step in range(max_new_tokens - 1):
@@ -548,30 +518,22 @@ class ASR:
       decode_ms = (time.time() - t_dec) * 1000
       total_decode_ms += decode_ms
 
-      # Strip EOS from this chunk's output
+      # Extract text from this chunk's full transcription
       while chunk_tokens and chunk_tokens[-1] in EOS_TOKEN_IDS: chunk_tokens.pop()
-      # Strip language tag / <asr_text> marker if present
       if TOKEN_ASR_TEXT in chunk_tokens:
         chunk_tokens = chunk_tokens[chunk_tokens.index(TOKEN_ASR_TEXT) + 1:]
-
-      raw_tokens.extend(chunk_tokens)
+      last_text = self.tok.decode(chunk_tokens).strip()
       chunk_idx += 1
 
-      if callback:
-        text_so_far = self.tok.decode(raw_tokens).strip()
-        callback(text_so_far, is_final)
+      if callback: callback(last_text, is_final)
 
     total_ms = (time.time() - t0) * 1000
-    # Strip EOS from final output
-    while raw_tokens and raw_tokens[-1] in EOS_TOKEN_IDS: raw_tokens.pop()
-    text = self.tok.decode(raw_tokens).strip()
-
     rtf = (total_ms / 1000) / audio_sec if audio_sec > 0 else 0
-    stderr_log(f"stream: {audio_sec:.1f}s audio, {len(raw_tokens)} tokens, "
+    stderr_log(f"stream: {audio_sec:.1f}s audio, {chunk_idx} chunks, "
                f"enc={total_enc_ms:.0f}ms, prefill={total_prefill_ms:.0f}ms, "
                f"decode={total_decode_ms:.0f}ms, total={total_ms:.0f}ms, RTF={rtf:.2f}\n")
 
-    return {"text": text, "elapsed_ms": total_ms, "audio_sec": audio_sec, "rtf": rtf}
+    return {"text": last_text, "elapsed_ms": total_ms, "audio_sec": audio_sec, "rtf": rtf}
 
 # ============================================================================
 # OpenAI-compatible server: /v1/audio/transcriptions

@@ -71,49 +71,55 @@ if __name__ == "__main__":
   print(f"Found {len(audio_files)} audio files, using first {args.n}")
 
   if args.stream:
-    # ---- Streaming mode: concatenate audio, process as continuous stream ----
+    # ---- Streaming mode: process each file individually via streaming ----
     audio_files = audio_files[:args.n + args.warmup]
 
     # Warmup with a few files in streaming mode
     print(f"\nWarming up ({args.warmup} files in stream mode)...")
-    warmup_audio = []
     for f in audio_files[:args.warmup]:
-      warmup_audio.append(load_audio(f))
-    warmup_concat = np.concatenate(warmup_audio)
-    model.transcribe_stream(warmup_concat)
+      audio = load_audio(f)
+      model.transcribe_stream(audio)
     print("Warmup done.\n")
 
-    # Concatenate test audio
+    total_errors, total_words = 0, 0
+    total_audio_sec, total_proc_ms = 0.0, 0.0
+
     test_files = audio_files[args.warmup:args.warmup + args.n]
-    test_audio_parts = []
-    test_refs = []
-    total_audio_sec = 0.0
-    for f in test_files:
-      audio = load_audio(f)
-      test_audio_parts.append(audio)
-      total_audio_sec += len(audio) / SAMPLE_RATE
-      utt_id = os.path.splitext(os.path.basename(f))[0]
-      test_refs.append(refs.get(utt_id, ""))
+    for i, fpath in enumerate(test_files):
+      utt_id = os.path.splitext(os.path.basename(fpath))[0]
+      ref_text = refs.get(utt_id, "")
+      audio = load_audio(fpath)
+      audio_sec = len(audio) / SAMPLE_RATE
 
-    concat_audio = np.concatenate(test_audio_parts)
-    concat_sec = len(concat_audio) / SAMPLE_RATE
-    print(f"Concatenated {len(test_files)} utterances: {concat_sec:.1f}s total audio")
+      result = model.transcribe_stream(audio)
+      hyp_text = result["text"]
+      proc_ms = result["elapsed_ms"]
 
-    # Run streaming transcription
-    result = model.transcribe_stream(concat_audio)
-    hyp_text = result["text"]
-    ref_text = " ".join(test_refs)
+      errs, nwords = wer(ref_text, hyp_text) if ref_text else (0, 0)
+      total_errors += errs
+      total_words += nwords
+      total_audio_sec += audio_sec
+      total_proc_ms += proc_ms
 
-    errs, nwords = wer(ref_text, hyp_text)
-    overall_wer = errs / nwords * 100 if nwords > 0 else 0
+      rtf = (proc_ms / 1000) / audio_sec if audio_sec > 0 else 0
+      utt_wer = errs / nwords * 100 if nwords > 0 else 0
+
+      if utt_wer > 5 or i < 5:
+        print(f"[{i+1:3d}/{args.n}] {audio_sec:5.1f}s  {proc_ms:6.0f}ms  RTF={rtf:.2f}  WER={utt_wer:5.1f}%  {utt_id}")
+        if utt_wer > 5:
+          print(f"    REF: {ref_text}")
+          print(f"    HYP: {hyp_text}")
+
+    overall_wer = total_errors / total_words * 100 if total_words > 0 else 0
+    overall_rtf = (total_proc_ms / 1000) / total_audio_sec if total_audio_sec > 0 else 0
+    avg_ms = total_proc_ms / len(test_files)
 
     print(f"\n{'='*60}")
-    print(f"Streaming results ({len(test_files)} utterances, {concat_sec:.1f}s audio):")
-    print(f"  WER:     {overall_wer:.2f}% ({errs}/{nwords} words)")
-    print(f"  RTF:     {result['rtf']:.3f} ({1/result['rtf']:.1f}x realtime)")
-    print(f"  Total:   {result['elapsed_ms']/1000:.1f}s processing")
-    print(f"\nFirst 200 chars of output:")
-    print(f"  {hyp_text[:200]}")
+    print(f"Streaming results ({len(test_files)} utterances, {total_audio_sec:.1f}s audio):")
+    print(f"  WER:     {overall_wer:.2f}% ({total_errors}/{total_words} words)")
+    print(f"  RTF:     {overall_rtf:.3f} ({1/overall_rtf:.1f}x realtime)")
+    print(f"  Avg:     {avg_ms:.0f}ms per utterance")
+    print(f"  Total:   {total_proc_ms/1000:.1f}s processing")
 
   else:
     # ---- Per-file mode ----
