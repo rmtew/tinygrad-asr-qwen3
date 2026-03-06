@@ -689,6 +689,15 @@ class ASR:
 # ============================================================================
 
 class StreamingSession:
+  """Server-side streaming session matching the C implementation's architecture.
+
+  Key design (from qwen_asr.c stream_impl):
+  - raw_tokens: full decoded history = prefix + continuation (unbounded, just IDs)
+  - Text prefix feedback: embed raw_tokens[:-rollback] and append after audio+suffix
+  - Candidate commit: text tokens minus rollback tail, LCP against previous stable
+  - emitted_text grows monotonically — old text never removed
+  - Encoder: sliding window of max 4 cached windows (32s audio context)
+  """
   def __init__(self, model: 'ASR', chunk_sec: float = 2.0, max_enc_windows: int = 4, max_new_tokens: int = 64):
     self.model = model
     self.chunk_samples = int(chunk_sec * SAMPLE_RATE)
@@ -696,10 +705,10 @@ class StreamingSession:
     self.max_new_tokens = max_new_tokens
     self.enc_window_frames = 800  # 8s of audio per encoder window
     self.enc_window_samples = self.enc_window_frames * HOP_LENGTH
-    dim = model.encoder.output_dim
 
     # Audio: only the partial tail since last complete window boundary
     self.tail_audio = np.array([], dtype=np.float32)
+    self._window_buf = np.array([], dtype=np.float32)
     self.total_samples = 0
 
     # Encoder window cache (bounded by max_enc_windows)
@@ -709,46 +718,63 @@ class StreamingSession:
     self.prev_embeds: np.ndarray | None = None
     self.prev_prompt_len = 0
 
-    # Result and stats
-    self.last_text = ""
+    # Text prefix feedback (C-style streaming)
+    self.raw_tokens: list[int] = []       # full decoded tokens (lang + text_marker + text)
+    self.stable_text_tokens: list[int] = []  # candidate tokens from last commit
+    self.emitted_text: str = ""           # accumulated committed text (grows monotonically)
+    self.rollback = 5                     # unfixed tail tokens
+    self.unfixed_chunks = 2               # first N chunks: no prefix feedback
+    self.max_prefix_tokens = 150          # bound prefix length in prompt
+
+    # Stats
     self.chunk_idx = 0
     self.total_reused = 0
     self.last_stats: dict = {}
+    self._is_final = False
 
   def feed(self, new_audio: np.ndarray, is_final: bool = False) -> dict:
     """Feed new audio samples. Returns {"text": ..., "stats": ...}."""
+    self._is_final = is_final
     if len(new_audio) > 0:
       self.tail_audio = np.append(self.tail_audio, new_audio)
       self.total_samples += len(new_audio)
 
-    # Process complete chunks
+    # Process complete chunks (not final yet)
+    self._is_final = False
     while len(self.tail_audio) >= self.chunk_samples:
-      self._process_up_to(self.total_samples - len(self.tail_audio) + self.chunk_samples)
+      remaining_after = len(self.tail_audio) - self.chunk_samples
+      self._is_final = is_final and remaining_after < self.chunk_samples
+      self._process_chunk()
 
     # On final: process any remaining audio
     if is_final and len(self.tail_audio) > 0:
-      self._process_up_to(self.total_samples)
+      self._is_final = True
+      self._process_chunk()
 
-    return {"text": self.last_text, "stats": self.last_stats}
+    # Build display: committed text + pending (unfixed) tail
+    text = self.emitted_text
+    # Add pending tokens (unfixed tail from latest decode)
+    text_start = 0
+    for i, t in enumerate(self.raw_tokens):
+      if t == TOKEN_ASR_TEXT: text_start = i + 1; break
+    text_tokens = self.raw_tokens[text_start:]
+    if len(text_tokens) > len(self.stable_text_tokens):
+      pending = text_tokens[len(self.stable_text_tokens):]
+      text += self.model.tok.decode(pending)
 
-  def _process_up_to(self, target_sample: int):
-    """Run encoder + prefill + decode for audio up to target_sample."""
+    return {"text": text.strip(), "stats": self.last_stats}
+
+  def _process_chunk(self):
+    """Process one chunk: encoder + text prefix + prefill + decode + commit."""
     model = self.model
     dim = model.encoder.output_dim
     t0 = time.time()
 
     # --- Encoder: cache complete windows, re-encode partial tail ---
-    # How many samples of tail_audio to consume this step
     consume = min(self.chunk_samples, len(self.tail_audio))
-    chunk_audio = self.tail_audio[:consume]
+    self._window_buf = np.append(self._window_buf, self.tail_audio[:consume])
     self.tail_audio = self.tail_audio[consume:]
 
-    # Accumulate into a running partial window buffer
-    if not hasattr(self, '_window_buf'):
-      self._window_buf = np.array([], dtype=np.float32)
-    self._window_buf = np.append(self._window_buf, chunk_audio)
-
-    # Complete any full encoder windows
     while len(self._window_buf) >= self.enc_window_samples:
       window_audio = self._window_buf[:self.enc_window_samples]
       self._window_buf = self._window_buf[self.enc_window_samples:]
@@ -758,14 +784,12 @@ class StreamingSession:
       if padded > mel.shape[1]:
         mel = np.pad(mel, ((0, 0), (0, padded - mel.shape[1])))
       enc_out = model.encoder.forward(mel[:, :padded])
-      actual_tokens = self.enc_window_frames // 8  # 100 tokens per 800-frame window
-      self.enc_cache.append((enc_out[:actual_tokens] + 0).realize())  # (+0) for fresh buffer
+      actual_tokens = self.enc_window_frames // 8
+      self.enc_cache.append((enc_out[:actual_tokens] + 0).realize())
 
-    # Evict old windows (sliding window)
     while len(self.enc_cache) > self.max_enc_windows:
       self.enc_cache.pop(0)
 
-    # Encode partial tail
     partial_enc = None
     if len(self._window_buf) > 0:
       mel = compute_mel(self._window_buf)
@@ -777,22 +801,37 @@ class StreamingSession:
       actual_partial = max(1, len(self._window_buf) // HOP_LENGTH // 8)
       partial_enc = (partial_out[:actual_partial] + 0).realize()
 
-    # Concatenate: cached windows + partial tail
     enc_parts = list(self.enc_cache) + ([partial_enc] if partial_enc is not None else [])
     if not enc_parts: return
     audio_embeds = Tensor.cat(*enc_parts, dim=0) if len(enc_parts) > 1 else enc_parts[0]
     enc_ms = (time.time() - t0) * 1000
 
-    # --- Prefill with KV cache reuse ---
+    # --- Text prefix feedback ---
+    # After initial chunks, feed previous decoded tokens (minus rollback) as context.
+    # This anchors the decoder so old text survives encoder window eviction.
+    n_prefix_full = 0  # uncapped prefix length (for raw_tokens tracking)
+    prefix_toks = []    # capped prefix (for prompt embedding)
+    if self.chunk_idx >= self.unfixed_chunks and len(self.raw_tokens) > 0:
+      n_prefix_full = max(0, len(self.raw_tokens) - self.rollback)
+      prefix_toks = self.raw_tokens[:n_prefix_full]
+      if len(prefix_toks) > self.max_prefix_tokens:
+        prefix_toks = prefix_toks[-self.max_prefix_tokens:]
+
+    # --- Build prompt: [system prefix] [encoder output] [suffix] [text prefix tokens] ---
     t_pf = time.time()
-    combined = Tensor.cat(model._prefix_embeds, audio_embeds, model._suffix_embeds, dim=0).reshape(1, -1, dim)
+    parts = [model._prefix_embeds, audio_embeds, model._suffix_embeds]
+    if prefix_toks:
+      tok_ids = Tensor([prefix_toks])
+      tok_embeds = model.decoder.tok_embeddings(tok_ids).squeeze(0).realize()
+      parts.append(tok_embeds)
+    combined = Tensor.cat(*parts, dim=0).reshape(1, -1, dim)
     prompt_len = combined.shape[1]
     assert prompt_len <= model._embed_buf.shape[1], f"prompt_len {prompt_len} > max_context"
 
     model._embed_buf[:, :prompt_len].assign(combined.contiguous()).realize()
     cur_embeds = model._embed_buf[0, :prompt_len].numpy()
 
-    # Find longest matching prefix with previous chunk
+    # KV cache reuse: find longest matching prefix with previous chunk
     reuse_point = 0
     if self.prev_embeds is not None:
       cmp_len = min(prompt_len, self.prev_prompt_len)
@@ -800,16 +839,13 @@ class StreamingSession:
         if not np.array_equal(cur_embeds[i], self.prev_embeds[i]): break
         reuse_point = i + 1
 
-    # Prefill delta
     delta = prompt_len - reuse_point
     if delta > 0:
-      sp_b = model.v_sp.bind(reuse_point)
-      nt_b = model.v_nt.bind(delta)
+      sp_b, nt_b = model.v_sp.bind(reuse_point), model.v_nt.bind(delta)
       out = model.decoder.prefill_embed_jit(model._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
       token = int(out.item())
     else:
-      sp_b = model.v_sp.bind(0)
-      nt_b = model.v_nt.bind(prompt_len)
+      sp_b, nt_b = model.v_sp.bind(0), model.v_nt.bind(prompt_len)
       out = model.decoder.prefill_embed_jit(model._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
       token = int(out.item())
 
@@ -818,24 +854,54 @@ class StreamingSession:
     self.total_reused += reuse_point
     prefill_ms = (time.time() - t_pf) * 1000
 
-    # --- Decode ---
+    # --- Decode (continuation after prefix) ---
     t_dec = time.time()
-    tokens = [token]
+    chunk_tokens = [token]
     for step in range(self.max_new_tokens - 1):
       if token in EOS_TOKEN_IDS: break
       pos = prompt_len + step
       out = model.decoder(Tensor([[token]]), model.v_dec_pos.bind(pos))
       token = int(out.item())
-      tokens.append(token)
+      chunk_tokens.append(token)
+    while chunk_tokens and chunk_tokens[-1] in EOS_TOKEN_IDS: chunk_tokens.pop()
     decode_ms = (time.time() - t_dec) * 1000
 
-    # Extract text
-    while tokens and tokens[-1] in EOS_TOKEN_IDS: tokens.pop()
-    if TOKEN_ASR_TEXT in tokens:
-      tokens = tokens[tokens.index(TOKEN_ASR_TEXT) + 1:]
-    self.last_text = model.tok.decode(tokens).strip()
+    # --- Update raw_tokens: prefix (uncapped) + newly decoded continuation ---
+    self.raw_tokens = self.raw_tokens[:n_prefix_full] + chunk_tokens
     self.chunk_idx += 1
 
+    # --- Commit logic (C-style): find candidate, LCP against stable, emit delta ---
+    text_start = 0
+    for i, t in enumerate(self.raw_tokens):
+      if t == TOKEN_ASR_TEXT: text_start = i + 1; break
+    text_tokens = self.raw_tokens[text_start:]
+    n_text = len(text_tokens)
+
+    # Candidate: everything except the unfixed rollback tail
+    if self._is_final:
+      candidate_len = n_text
+    elif self.chunk_idx > self.unfixed_chunks:
+      candidate_len = max(0, n_text - self.rollback)
+      if candidate_len <= 0 and n_text > 0: candidate_len = n_text - 1
+    else:
+      candidate_len = 0
+
+    candidate = text_tokens[:candidate_len]
+
+    # LCP: longest common prefix with previous stable tokens
+    lcp = 0
+    while lcp < len(self.stable_text_tokens) and lcp < candidate_len \
+          and self.stable_text_tokens[lcp] == candidate[lcp]:
+      lcp += 1
+
+    # Emit delta: new tokens from lcp to candidate_len
+    if lcp < candidate_len:
+      new_tokens = candidate[lcp:]
+      self.emitted_text += model.tok.decode(new_tokens)
+
+    self.stable_text_tokens = list(candidate)
+
+    # --- Stats ---
     total_ms = enc_ms + prefill_ms + decode_ms
     audio_sec = self.total_samples / SAMPLE_RATE
     rtf = (total_ms / 1000) / audio_sec if audio_sec > 0 else 0
@@ -851,11 +917,15 @@ class StreamingSession:
       "prompt_len": prompt_len,
       "enc_windows": len(self.enc_cache),
       "max_windows": self.max_enc_windows,
-      "decode_tokens": len(tokens),
+      "decode_tokens": len(chunk_tokens),
+      "committed": len(self.stable_text_tokens),
+      "pending": n_text - candidate_len,
+      "prefix_fed": len(prefix_toks),
     }
-    stderr_log(f"chunk {self.chunk_idx}: {audio_sec:.1f}s total, "
+    stderr_log(f"chunk {self.chunk_idx}: {audio_sec:.1f}s, "
                f"enc={enc_ms:.0f}ms, prefill={prefill_ms:.0f}ms ({reuse_point} reused), "
-               f"decode={decode_ms:.0f}ms ({len(tokens)} tok)\n")
+               f"decode={decode_ms:.0f}ms ({len(chunk_tokens)} tok), "
+               f"committed={len(self.stable_text_tokens)}, prefix={len(prefix_toks)}\n")
 
 # ============================================================================
 # OpenAI-compatible server with live microphone transcription

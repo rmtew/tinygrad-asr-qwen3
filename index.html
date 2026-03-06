@@ -81,17 +81,19 @@ function updateStats(s) {
   if (!s || !s.chunk) { statLine.innerHTML = ''; statDetail.innerHTML = ''; return; }
   const rtfColor = s.rtf < 0.2 ? '#4caf50' : s.rtf < 0.5 ? '#ff9800' : '#f44336';
   statLine.innerHTML = [
-    stat('⏱', s.audio_sec + 's'),
+    stat('time', s.audio_sec + 's'),
     stat('RTF', `<span style="color:${rtfColor}">${s.rtf.toFixed(2)}</span>`),
     stat('latency', s.total_ms + 'ms'),
     stat('windows', s.enc_windows + '/' + s.max_windows),
-    stat('reused', s.reused + '/' + s.prompt_len),
+    stat('committed', (s.committed || 0) + ' tok'),
+    stat('pending', (s.pending || 0) + ' tok'),
   ].join('');
   statDetail.innerHTML = [
     stat('enc', s.enc_ms + 'ms'),
     stat('prefill', s.prefill_ms + 'ms'),
     stat('decode', s.decode_ms + 'ms'),
-    stat('tokens', s.decode_tokens),
+    stat('kv reused', s.reused + '/' + s.prompt_len),
+    stat('prefix fed', (s.prefix_fed || 0) + ' tok'),
     stat('chunk', '#' + s.chunk),
   ].join('');
 }
