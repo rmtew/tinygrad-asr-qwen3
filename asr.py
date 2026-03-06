@@ -678,6 +678,169 @@ class ASR:
     return {"text": last_text, "elapsed_ms": total_ms, "audio_sec": audio_sec, "rtf": rtf}
 
 # ============================================================================
+# StreamingSession: server-side state for incremental live transcription
+#
+# Mirrors the C implementation's streaming architecture:
+# - Client sends audio deltas (new PCM samples)
+# - Server accumulates, caches complete encoder windows (bounded, sliding)
+# - Re-encodes only the partial tail each chunk
+# - Decoder KV cache reused across chunks via embedding comparison
+# - Bounded: max 4 encoder windows (32s audio context)
+# ============================================================================
+
+class StreamingSession:
+  def __init__(self, model: 'ASR', chunk_sec: float = 2.0, max_enc_windows: int = 4, max_new_tokens: int = 64):
+    self.model = model
+    self.chunk_samples = int(chunk_sec * SAMPLE_RATE)
+    self.max_enc_windows = max_enc_windows
+    self.max_new_tokens = max_new_tokens
+    self.enc_window_frames = 800  # 8s of audio per encoder window
+    self.enc_window_samples = self.enc_window_frames * HOP_LENGTH
+    dim = model.encoder.output_dim
+
+    # Audio: only the partial tail since last complete window boundary
+    self.tail_audio = np.array([], dtype=np.float32)
+    self.total_samples = 0
+
+    # Encoder window cache (bounded by max_enc_windows)
+    self.enc_cache: list[Tensor] = []
+
+    # Decoder KV reuse state
+    self.prev_embeds: np.ndarray | None = None
+    self.prev_prompt_len = 0
+
+    # Result
+    self.last_text = ""
+    self.chunk_idx = 0
+    self.total_reused = 0
+
+  def feed(self, new_audio: np.ndarray, is_final: bool = False) -> str:
+    """Feed new audio samples. Processes complete 2s chunks, returns current text."""
+    if len(new_audio) > 0:
+      self.tail_audio = np.append(self.tail_audio, new_audio)
+      self.total_samples += len(new_audio)
+
+    # Process complete chunks
+    while len(self.tail_audio) >= self.chunk_samples:
+      self._process_up_to(self.total_samples - len(self.tail_audio) + self.chunk_samples)
+
+    # On final: process any remaining audio
+    if is_final and len(self.tail_audio) > 0:
+      self._process_up_to(self.total_samples)
+
+    return self.last_text
+
+  def _process_up_to(self, target_sample: int):
+    """Run encoder + prefill + decode for audio up to target_sample."""
+    model = self.model
+    dim = model.encoder.output_dim
+    t0 = time.time()
+
+    # --- Encoder: cache complete windows, re-encode partial tail ---
+    # How many samples of tail_audio to consume this step
+    consume = min(self.chunk_samples, len(self.tail_audio))
+    chunk_audio = self.tail_audio[:consume]
+    self.tail_audio = self.tail_audio[consume:]
+
+    # Accumulate into a running partial window buffer
+    if not hasattr(self, '_window_buf'):
+      self._window_buf = np.array([], dtype=np.float32)
+    self._window_buf = np.append(self._window_buf, chunk_audio)
+
+    # Complete any full encoder windows
+    while len(self._window_buf) >= self.enc_window_samples:
+      window_audio = self._window_buf[:self.enc_window_samples]
+      self._window_buf = self._window_buf[self.enc_window_samples:]
+      mel = compute_mel(window_audio)
+      bucket = model.encoder.chunk_size * 8
+      padded = ((mel.shape[1] + bucket - 1) // bucket) * bucket
+      if padded > mel.shape[1]:
+        mel = np.pad(mel, ((0, 0), (0, padded - mel.shape[1])))
+      enc_out = model.encoder.forward(mel[:, :padded])
+      actual_tokens = self.enc_window_frames // 8  # 100 tokens per 800-frame window
+      self.enc_cache.append((enc_out[:actual_tokens] + 0).realize())  # (+0) for fresh buffer
+
+    # Evict old windows (sliding window)
+    while len(self.enc_cache) > self.max_enc_windows:
+      self.enc_cache.pop(0)
+
+    # Encode partial tail
+    partial_enc = None
+    if len(self._window_buf) > 0:
+      mel = compute_mel(self._window_buf)
+      bucket = model.encoder.chunk_size * 8
+      padded = ((mel.shape[1] + bucket - 1) // bucket) * bucket
+      if padded > mel.shape[1]:
+        mel = np.pad(mel, ((0, 0), (0, padded - mel.shape[1])))
+      partial_out = model.encoder.forward(mel[:, :padded])
+      actual_partial = max(1, len(self._window_buf) // HOP_LENGTH // 8)
+      partial_enc = (partial_out[:actual_partial] + 0).realize()
+
+    # Concatenate: cached windows + partial tail
+    enc_parts = list(self.enc_cache) + ([partial_enc] if partial_enc is not None else [])
+    if not enc_parts: return
+    audio_embeds = Tensor.cat(*enc_parts, dim=0) if len(enc_parts) > 1 else enc_parts[0]
+    enc_ms = (time.time() - t0) * 1000
+
+    # --- Prefill with KV cache reuse ---
+    t_pf = time.time()
+    combined = Tensor.cat(model._prefix_embeds, audio_embeds, model._suffix_embeds, dim=0).reshape(1, -1, dim)
+    prompt_len = combined.shape[1]
+    assert prompt_len <= model._embed_buf.shape[1], f"prompt_len {prompt_len} > max_context"
+
+    model._embed_buf[:, :prompt_len].assign(combined.contiguous()).realize()
+    cur_embeds = model._embed_buf[0, :prompt_len].numpy()
+
+    # Find longest matching prefix with previous chunk
+    reuse_point = 0
+    if self.prev_embeds is not None:
+      cmp_len = min(prompt_len, self.prev_prompt_len)
+      for i in range(cmp_len):
+        if not np.array_equal(cur_embeds[i], self.prev_embeds[i]): break
+        reuse_point = i + 1
+
+    # Prefill delta
+    delta = prompt_len - reuse_point
+    if delta > 0:
+      sp_b = model.v_sp.bind(reuse_point)
+      nt_b = model.v_nt.bind(delta)
+      out = model.decoder.prefill_embed_jit(model._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
+      token = int(out.item())
+    else:
+      sp_b = model.v_sp.bind(0)
+      nt_b = model.v_nt.bind(prompt_len)
+      out = model.decoder.prefill_embed_jit(model._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
+      token = int(out.item())
+
+    self.prev_embeds = cur_embeds.copy()
+    self.prev_prompt_len = prompt_len
+    self.total_reused += reuse_point
+    prefill_ms = (time.time() - t_pf) * 1000
+
+    # --- Decode ---
+    t_dec = time.time()
+    tokens = [token]
+    for step in range(self.max_new_tokens - 1):
+      if token in EOS_TOKEN_IDS: break
+      pos = prompt_len + step
+      out = model.decoder(Tensor([[token]]), model.v_dec_pos.bind(pos))
+      token = int(out.item())
+      tokens.append(token)
+    decode_ms = (time.time() - t_dec) * 1000
+
+    # Extract text
+    while tokens and tokens[-1] in EOS_TOKEN_IDS: tokens.pop()
+    if TOKEN_ASR_TEXT in tokens:
+      tokens = tokens[tokens.index(TOKEN_ASR_TEXT) + 1:]
+    self.last_text = model.tok.decode(tokens).strip()
+    self.chunk_idx += 1
+
+    audio_sec = self.total_samples / SAMPLE_RATE
+    stderr_log(f"chunk {self.chunk_idx}: {audio_sec:.1f}s total, "
+               f"enc={enc_ms:.0f}ms, prefill={prefill_ms:.0f}ms ({reuse_point} reused), "
+               f"decode={decode_ms:.0f}ms ({len(tokens)} tok)\n")
+
+# ============================================================================
 # OpenAI-compatible server with live microphone transcription
 # ============================================================================
 
@@ -713,6 +876,7 @@ ASR_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad ASR</title><style>
 <script>
 const T = document.getElementById('transcript'), S = document.getElementById('status');
 let audioCtx, source, processor, pcmChunks, recording = false, sendTimer, sending = false, queued = false;
+let sentChunkIdx = 0, totalSent = 0;
 
 // Build a WAV blob from float32 PCM samples - no codec issues, always works
 function buildWav(samples, sr) {
@@ -729,12 +893,16 @@ function buildWav(samples, sr) {
   return new Blob([buf], { type: 'audio/wav' });
 }
 
-function getPCM() {
+// Get only NEW pcm samples since last send (delta)
+function getDeltaPCM() {
+  const newChunks = pcmChunks.slice(sentChunkIdx);
+  sentChunkIdx = pcmChunks.length;
   let len = 0;
-  for (const c of pcmChunks) len += c.length;
+  for (const c of newChunks) len += c.length;
   const out = new Float32Array(len);
   let off = 0;
-  for (const c of pcmChunks) { out.set(c, off); off += c.length; }
+  for (const c of newChunks) { out.set(c, off); off += c.length; }
+  totalSent += len;
   return out;
 }
 
@@ -746,7 +914,7 @@ async function toggleMic() {
     source = audioCtx.createMediaStreamSource(stream);
     // ScriptProcessorNode captures raw PCM - no codec, no container format issues
     processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    pcmChunks = [];
+    pcmChunks = []; sentChunkIdx = 0; totalSent = 0;
     processor.onaudioprocess = e => pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
     source.connect(processor);
     processor.connect(audioCtx.destination);
@@ -754,7 +922,9 @@ async function toggleMic() {
     document.getElementById('mic').textContent = 'Stop';
     document.getElementById('mic').className = 'on';
     S.textContent = 'Listening...';
-    sendTimer = setInterval(() => sendPCM(false), 2000);
+    // Tell server to start a new streaming session
+    await fetch('/v1/audio/stream?action=start', { method: 'POST' });
+    sendTimer = setInterval(() => sendDelta(false), 2000);
   } catch(e) { S.textContent = 'Mic error: ' + e.message; }
 }
 
@@ -766,37 +936,40 @@ function stopMic() {
   recording = false;
   document.getElementById('mic').textContent = 'Record';
   document.getElementById('mic').className = '';
-  sendPCM(true);
+  sendDelta(true);
 }
 
-async function sendPCM(isFinal) {
-  if (pcmChunks.length === 0) return;
+async function sendDelta(isFinal) {
+  const delta = getDeltaPCM();
+  if (delta.length === 0 && !isFinal) return;
   if (sending) { queued = isFinal ? 'final' : (queued || true); return; }
   sending = true;
-  const samples = getPCM();
   const sr = audioCtx ? audioCtx.sampleRate : 16000;
-  S.textContent = isFinal ? 'Transcribing...' : (samples.length / sr).toFixed(1) + 's...';
-  await transcribe(buildWav(samples, sr), 'recording.wav');
+  const dur = (totalSent / sr).toFixed(1);
+  S.textContent = isFinal ? 'Transcribing...' : dur + 's...';
+  const action = isFinal ? 'end' : 'feed';
+  const fd = new FormData();
+  fd.append('file', buildWav(delta, sr), 'chunk.wav');
+  try {
+    const r = await fetch('/v1/audio/stream?action=' + action, { method: 'POST', body: fd });
+    const d = await r.json();
+    T.textContent = d.text;
+    if (!recording) S.textContent = d.status === 'done' ? '' : '';
+  } catch(e) { S.textContent = 'Error: ' + e.message; }
   sending = false;
-  // Catch up: if a send was requested while busy, fire immediately with latest audio
-  if (queued) { const fin = queued === 'final'; queued = false; sendPCM(fin); }
+  if (queued) { const fin = queued === 'final'; queued = false; sendDelta(fin); }
 }
 
 async function uploadFile(file) {
   if (!file) return;
   S.textContent = 'Transcribing ' + file.name + '...';
-  await transcribe(file, file.name);
-}
-
-async function transcribe(blob, filename) {
   const fd = new FormData();
-  fd.append('file', blob, filename || 'audio.wav');
-  if (!S.textContent) S.textContent = 'Transcribing...';
+  fd.append('file', file, file.name);
   try {
     const r = await fetch('/v1/audio/transcriptions', { method: 'POST', body: fd });
     const d = await r.json();
     T.textContent = d.text;
-    if (!recording) S.textContent = '';
+    S.textContent = '';
   } catch(e) { S.textContent = 'Error: ' + e.message; }
 }
 
@@ -811,6 +984,7 @@ document.addEventListener('drop', e => {
 
 class ASRHandler(HTTPRequestHandler):
   model: ASR  # set before serving
+  session: StreamingSession | None = None  # global streaming session (single-user server)
 
   def log_request(self, code='-', size='-'): pass
 
@@ -822,39 +996,89 @@ class ASRHandler(HTTPRequestHandler):
     else: self.send_error(404)
 
   def do_POST(self):
-    if self.path != '/v1/audio/transcriptions':
-      self.send_error(404); return
+    if self.path == '/v1/audio/transcriptions':
+      self._handle_transcribe()
+    elif self.path.startswith('/v1/audio/stream'):
+      self._handle_stream()
+    else:
+      self.send_error(404)
 
+  def _handle_transcribe(self):
+    """One-shot file transcription (stateless, per-file mode)."""
     body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
     content_type = self.headers.get('Content-Type', '')
     audio_data, filename = self._extract_audio(body, content_type)
     if audio_data is None:
       self.send_error(400, "No audio file found"); return
 
-    # Detect format from filename, default to .bin (ffmpeg auto-detects)
     suffix = os.path.splitext(filename)[1] if filename else '.bin'
-    if not suffix or suffix == '.': suffix = '.webm'
+    if not suffix or suffix == '.': suffix = '.wav'
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
       f.write(audio_data)
       tmp_path = f.name
     try:
-      audio = load_audio(tmp_path)
-      audio_sec = len(audio) / SAMPLE_RATE
-      rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) > 0 else 0
-      stderr_log(f"recv: {len(audio_data)} bytes {suffix}, {audio_sec:.1f}s {len(audio)} samples, RMS={rms:.4f}\n")
-      if rms < 0.001:
-        stderr_log(f"WARNING: audio RMS near zero -- likely silence or corrupt file\n")
-      # Always use per-file mode for HTTP requests. Each request is stateless,
-      # so transcribe_stream would re-process all chunks from scratch (6x slower).
-      # Per-file does one encoder pass + one prefill + one decode, scales fine
-      # to minutes of audio via the two-path encoder (sequential for >32s).
       result = self.model.transcribe(tmp_path)
       self.send_data(json.dumps({"text": result["text"]}).encode())
     except Exception as e:
       self.send_data(json.dumps({"error": str(e)}).encode(), status_code=500)
     finally:
       os.unlink(tmp_path)
+
+  def _handle_stream(self):
+    """Streaming transcription: client sends audio deltas, server maintains session state.
+
+    POST /v1/audio/stream?action=start  -> reset session
+    POST /v1/audio/stream?action=feed   -> body: WAV delta, returns {"text": "..."}
+    POST /v1/audio/stream?action=end    -> process remaining audio, clear session
+    """
+    from urllib.parse import urlparse, parse_qs
+    params = parse_qs(urlparse(self.path).query)
+    action = params.get('action', ['feed'])[0]
+
+    if action == 'start':
+      ASRHandler.session = StreamingSession(self.model)
+      stderr_log("stream session started\n")
+      self.send_data(json.dumps({"text": "", "status": "started"}).encode())
+      return
+
+    if ASRHandler.session is None:
+      # Auto-start if no explicit start
+      ASRHandler.session = StreamingSession(self.model)
+      stderr_log("stream session auto-started\n")
+
+    if action in ('feed', 'end'):
+      body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+      content_type = self.headers.get('Content-Type', '')
+
+      # Extract and decode audio delta
+      audio = np.array([], dtype=np.float32)
+      if len(body) > 0:
+        audio_data, filename = self._extract_audio(body, content_type)
+        if audio_data and len(audio_data) > 0:
+          suffix = os.path.splitext(filename)[1] if filename else '.wav'
+          if not suffix or suffix == '.': suffix = '.wav'
+          with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(audio_data)
+            tmp_path = f.name
+          try:
+            audio = load_audio(tmp_path)
+          finally:
+            os.unlink(tmp_path)
+
+      is_final = action == 'end'
+      text = ASRHandler.session.feed(audio, is_final=is_final)
+
+      resp = {"text": text}
+      if is_final:
+        ASRHandler.session = None
+        resp["status"] = "done"
+        stderr_log("stream session ended\n")
+
+      self.send_data(json.dumps(resp).encode())
+      return
+
+    self.send_error(400, f"Unknown action: {action}")
 
   def _extract_audio(self, body: bytes, content_type: str) -> tuple[bytes | None, str]:
     """Extract audio bytes and filename from multipart/form-data or raw body."""
