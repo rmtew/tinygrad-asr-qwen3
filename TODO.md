@@ -7,7 +7,7 @@
 - ~~**Microphone/live transcription.**~~ Record button, live updates every 2s, drag-and-drop.
 - ~~**C-style streaming architecture.**~~ Text prefix feedback, monotonic commit, overlap dedup, repeat suppression, stagnation recovery, periodic reset. Matches `qwen_asr.c stream_impl` design.
 - ~~**Diagnostic logging.**~~ Per-chunk server log: decoded text, LCP/commit flow, emit delta, pending tail, recovery events. Correlates browser sessions to quality issues.
-- ~~**Quality test infrastructure.**~~ `test_stream_quality.py`: streaming vs per-file WER on clean, noisy, real mic audio. `test_session.py`: diagnostic harness for StreamingSession.feed().
+- ~~**Quality test infrastructure.**~~ `tests/test_stream_quality.py`: streaming vs per-file WER on clean, noisy, real mic audio. `tests/test_session.py`: diagnostic harness for StreamingSession.feed().
 - ~~**Browser noise suppression.**~~ `getUserMedia` with `noiseSuppression`, `echoCancellation`, `autoGainControl`.
 - ~~**WebSocket streaming.**~~ Replaces HTTP polling. Binary Int16 PCM frames, JSON responses. Lower overhead per chunk.
 - ~~**Confidence display.**~~ Committed text (bright) vs pending rollback tail (dim italic) in web UI.
@@ -29,14 +29,16 @@
 
 ## Testing
 
-- **Regression tests.** `test.py` covers: JFK exact match (per-file + streaming), 5-file LibriSpeech WER, RTF gates. Could add:
-  - Streaming session WER gate (currently only in `test_stream_quality.py`, not in CI).
+- **Regression tests.** `tests/test.py` covers: JFK exact match (per-file + streaming), 5-file LibriSpeech WER, RTF gates. Could add:
+  - Streaming session WER gate (currently only in `tests/test_stream_quality.py`, not in CI).
   - Recovery mechanism coverage: verify stagnation detection triggers, periodic reset works.
 - **Long-form audio benchmarks.** Current test data maxes at 119s. Need varied speakers, background noise, topic changes.
 
 ## Code Cleanup
 
-- **Separate modules.** `asr.py` is ~1100 lines. AudioEncoder, ASR model, StreamingSession, server handler, and CLI could be split.
+- ~~**Dead code removal.**~~ Removed `ASR.transcribe_stream()` (165 lines, superseded by `StreamingSession`), `_handle_stream()` HTTP endpoint (55 lines, superseded by WebSocket), unused imports.
+- ~~**Tests to `tests/` folder.**~~ All test files moved to `tests/`.
+- **Separate modules.** `asr.py` is ~1200 lines. AudioEncoder, ASR model, StreamingSession, server, and CLI could be split if it keeps growing.
 
 ## Features
 

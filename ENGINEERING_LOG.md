@@ -46,7 +46,7 @@ Decisions, failed approaches, and solutions encountered during development. Inte
 
 ## Symbolic variable sharing across methods
 
-**Problem:** `transcribe()` and `transcribe_stream()` both call the decoder's JIT'd prefill. Initially each method created its own `UOp.variable(...)` instances with the same name. This caused separate JIT compilations per method — the JIT saw different variable objects despite identical names.
+**Problem:** `transcribe()` and the streaming path both call the decoder's JIT'd prefill. Initially each method created its own `UOp.variable(...)` instances with the same name. This caused separate JIT compilations per method — the JIT saw different variable objects despite identical names.
 
 **Solution:** Create shared symbolic variables once in `__init__`: `self.v_sp`, `self.v_nt`, `self.v_dec_pos`. Both methods use the same variable objects. Single JIT compilation serves all callers.
 
@@ -186,7 +186,7 @@ Both produce identical output because attention is windowed — no cross-window 
 
 ## Streaming quality baselines
 
-**Test infrastructure:** `test_stream_quality.py` compares streaming vs per-file WER. `test_session.py` runs `StreamingSession.feed()` with per-chunk diagnostic output.
+**Test infrastructure:** `tests/test_stream_quality.py` compares streaming vs per-file WER. `tests/test_session.py` runs `StreamingSession.feed()` with per-chunk diagnostic output.
 
 **Results (0.6B model, RTX 3070 Laptop):**
 

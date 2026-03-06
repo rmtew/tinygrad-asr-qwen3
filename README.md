@@ -92,18 +92,7 @@ Server → Client:
   Text frame:   {"committed":"...","pending":"...","stats":{...}}
 ```
 
-Streaming via HTTP (stateful session):
-
-```bash
-# Start session
-curl -X POST http://localhost:8090/v1/audio/stream?action=start
-
-# Feed audio deltas (multipart WAV)
-curl -X POST http://localhost:8090/v1/audio/stream?action=feed -F "file=@chunk.wav"
-
-# End session
-curl -X POST http://localhost:8090/v1/audio/stream?action=end
-```
+The WebSocket server runs on HTTP port + 1 (default 8091).
 
 ## Performance
 
@@ -143,19 +132,25 @@ CUDA=1 JITBEAM=2 python asr.py --serve
 
 ```bash
 # Quick tests (~30s): JFK exact match, streaming, 5 diverse LibriSpeech files
-CUDA=1 JITBEAM=2 python test.py
+CUDA=1 JITBEAM=2 python tests/test.py
 
 # With performance regression gates
-CUDA=1 JITBEAM=2 python test.py --perf
+CUDA=1 JITBEAM=2 python tests/test.py --perf
 
 # Full benchmark: 30-file LibriSpeech WER + RTF (per-file and streaming)
-CUDA=1 JITBEAM=2 python test.py --full
+CUDA=1 JITBEAM=2 python tests/test.py --full
 
 # Streaming session diagnostics (feed() with per-chunk logging)
-python test_session.py path/to/audio.wav
+python tests/test_session.py path/to/audio.wav
 
 # Streaming vs per-file WER comparison
-python test_stream_quality.py
+python tests/test_stream_quality.py
+
+# WebSocket protocol tests (no model required)
+python tests/test_ws.py
+
+# Parameter sweep: grid-search chunk_sec × rollback
+CUDA=1 BEAM=2 python sweep_params.py captures/*.wav
 ```
 
 ## Models
