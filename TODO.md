@@ -12,20 +12,20 @@
 - ~~**WebSocket streaming.**~~ Replaces HTTP polling. Binary Int16 PCM frames, JSON responses. Lower overhead per chunk.
 - ~~**Confidence display.**~~ Committed text (bright) vs pending rollback tail (dim italic) in web UI.
 
-## Streaming Quality
+## Streaming Quality — Parameter Sweep
 
 Current streaming WER gap vs per-file (per-file is 0%):
 - Clean 11s: 0% | Clean 119s: 9.3% | Real mic 47s: 23.3%
 
-- **Investigate remaining 9% clean baseline gap.** Each 2s chunk generates ~5-13 tokens continuation with rollback=5, so only ~0-8 net new tokens committed per chunk. Fundamental to the architecture — model under-generates relative to speech rate. Options:
-  - Test larger `chunk_sec` (4s, 8s) — more tokens per chunk, fewer rollback losses, higher latency.
-  - Test `rollback=3` without recovery mechanisms (simpler, may work for clean audio).
-  - Server-side noise reduction (`noisereduce` spectral gating or high-pass filter) for mic audio.
-- **Long-form audio testing.** Need 10-30 minute test clips (podcast, lecture) to stress the periodic reset and long-term drift behavior. Current max is 119s.
+The two main knobs are `chunk_sec` (latency vs throughput) and `rollback` (safety vs waste). Need data to pick defaults.
+
+- **`--save-audio` flag.** Server saves each session's raw PCM to a timestamped WAV file. Captures real mic audio for offline replay — zero cost when off.
+- **`sweep_params.py` tool.** Takes a captured WAV + reference transcript, runs it through `StreamingSession` with a grid of `(chunk_sec, rollback)` values, reports WER and committed word count for each combo. Determines the best operating points for live vs batch use cases.
+- **UI presets.** Dropdown or toggle in the web UI: e.g. "Live" (2s/rollback=5), "Balanced" (4s/rollback=4), "Accurate" (8s/rollback=3). Sent in the WebSocket `start` message, server creates session with those params. Defaults chosen from sweep results.
+- **Long-form audio testing.** Need 10-30 minute test clips (podcast, lecture) to stress periodic reset and long-term drift. Current max is 119s.
 
 ## Performance
 
-- **Larger streaming chunks.** Test 4s or 8s `chunk_sec` to reduce encoder/prefill/decode cycles. Tradeoff: higher latency for first text output.
 - **Encoder partial-tail caching.** The partial tail (audio beyond the last complete 8s window) is re-encoded from scratch every chunk. Could cache and extend.
 - **Pre-warm more encoder buckets.** New bucket sizes trigger JIT compilation on first encounter (~3-4s). Could pre-warm common sizes during startup.
 
