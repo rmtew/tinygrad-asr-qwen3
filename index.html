@@ -101,7 +101,9 @@ function updateStats(s) {
 async function toggleMic() {
   if (recording) { stopMic(); return; }
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true }
+    });
     audioCtx = new AudioContext({ sampleRate: 16000 });
     source = audioCtx.createMediaStreamSource(stream);
     // ScriptProcessorNode captures raw PCM — no codec, no container format issues
