@@ -1123,24 +1123,26 @@ def _ws_recv(rfile) -> tuple[int, bytes]:
     fragments.append(payload)
     if fin: return msg_opcode or opcode, b''.join(fragments)
 
-def _ws_send(sock, opcode: int, payload: bytes):
+def _ws_send(wfile, opcode: int, payload: bytes):
   """Send one WebSocket frame (unmasked, server-to-client)."""
   header = bytes([0x80 | opcode])
   n = len(payload)
   if n < 126: header += bytes([n])
   elif n < 65536: header += bytes([126]) + n.to_bytes(2, 'big')
   else: header += bytes([127]) + n.to_bytes(8, 'big')
-  sock.sendall(header + payload)
+  wfile.write(header + payload)
+  wfile.flush()
 
 class ASRHandler(HTTPRequestHandler):
   model: ASR  # set before serving
   session: StreamingSession | None = None  # global streaming session (single-user server)
+  save_audio_dir: str | None = None  # --save-audio directory
 
   def log_request(self, code='-', size='-'): pass
 
   def do_GET(self):
     if self.path == '/ws' and 'upgrade' in self.headers.get('Connection', '').lower():
-      self._handle_ws()
+      self._handle_ws(); return
     elif self.path == '/':
       html_path = os.path.join(_HTML_DIR, 'index.html')
       try: self.send_data(open(html_path, 'rb').read(), content_type="text/html")
@@ -1164,36 +1166,39 @@ class ASRHandler(HTTPRequestHandler):
     key = self.headers.get('Sec-WebSocket-Key', '')
     if not key: self.send_error(400, "Missing Sec-WebSocket-Key"); return
     accept = base64.b64encode(hashlib.sha1(key.encode() + _WS_MAGIC).digest()).decode()
-    self.request.sendall((
-      "HTTP/1.1 101 Switching Protocols\r\n"
-      "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-      f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
-    ).encode())
+    self.protocol_version = "HTTP/1.1"  # WebSocket requires 1.1
+    self.send_response(101, "Switching Protocols")
+    self.send_header("Upgrade", "websocket")
+    self.send_header("Connection", "Upgrade")
+    self.send_header("Sec-WebSocket-Accept", accept)
+    self.end_headers()
     self.close_connection = True
 
     session = None
-    sock = self.request
+    wfile = self.wfile
+    audio_chunks: list[np.ndarray] = []  # for --save-audio
     try:
       while True:
         opcode, payload = _ws_recv(self.rfile)
         if opcode == 0x8:  # close
-          try: _ws_send(sock, 0x8, b'')
+          try: _ws_send(wfile, 0x8, b'')
           except OSError: pass
           break
         if opcode == 0x9:  # ping → pong
-          _ws_send(sock, 0xA, payload); continue
+          _ws_send(wfile, 0xA, payload); continue
 
         if opcode == 0x1:  # text message (JSON control)
           msg = json.loads(payload)
           if msg.get('type') == 'start':
             session = StreamingSession(self.model)
             ASRHandler.session = session
+            audio_chunks = []
             stderr_log("ws: session started\n")
-            _ws_send(sock, 0x1, json.dumps({"committed":"","pending":"","status":"started"}).encode())
+            _ws_send(wfile, 0x1, json.dumps({"committed":"","pending":"","status":"started"}).encode())
           elif msg.get('type') == 'end':
             if session:
               result = session.feed(np.array([], dtype=np.float32), is_final=True)
-              _ws_send(sock, 0x1, json.dumps({
+              _ws_send(wfile, 0x1, json.dumps({
                 "committed": result["text"], "pending": "",
                 "stats": result.get("stats", {}), "status": "done",
               }).encode())
@@ -1203,16 +1208,37 @@ class ASRHandler(HTTPRequestHandler):
         elif opcode == 0x2:  # binary message (Int16 PCM audio)
           if session and len(payload) >= 2:
             audio = np.frombuffer(payload, dtype=np.int16).astype(np.float32) / 32768.0
+            audio_chunks.append(audio)
             result = session.feed(audio)
-            _ws_send(sock, 0x1, json.dumps({
+            _ws_send(wfile, 0x1, json.dumps({
               "committed": result["committed"], "pending": result["pending"],
               "stats": result.get("stats", {}),
             }).encode())
-    except (OSError, ValueError):
-      pass
+    except Exception as e:
+      stderr_log(f"ws: error: {type(e).__name__}: {e}\n")
     finally:
       if session: ASRHandler.session = None
+      self._save_session_audio(audio_chunks)
       stderr_log("ws: connection closed\n")
+
+  def _save_session_audio(self, chunks: list[np.ndarray]):
+    """Save accumulated session audio to WAV if --save-audio is set."""
+    if not ASRHandler.save_audio_dir or not chunks: return
+    try:
+      audio = np.concatenate(chunks)
+      if len(audio) == 0: return
+      os.makedirs(ASRHandler.save_audio_dir, exist_ok=True)
+      ts = time.strftime("%Y%m%d_%H%M%S")
+      path = os.path.join(ASRHandler.save_audio_dir, f"session_{ts}.wav")
+      int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+      with wave.open(path, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(int16.tobytes())
+      stderr_log(f"saved {len(audio)/SAMPLE_RATE:.1f}s audio to {path}\n")
+    except Exception as e:
+      stderr_log(f"save-audio error: {e}\n")
 
   def do_POST(self):
     if self.path == '/v1/audio/transcriptions':
@@ -1345,6 +1371,7 @@ if __name__ == "__main__":
   parser = argparse.ArgumentParser(description="Qwen3-ASR inference via tinygrad")
   parser.add_argument("--model", "-m", required=True, help="Path to GGUF file, or model name to download (e.g. qwen3-asr:0.6b)")
   parser.add_argument("--serve", nargs='?', type=int, const=8090, metavar="PORT", help="Run OpenAI-compatible API server")
+  parser.add_argument("--save-audio", metavar="DIR", help="Save streaming session audio to WAV files in DIR")
   parser.add_argument("audio", nargs='?', help="WAV file to transcribe (omit for interactive mode)")
   args = parser.parse_args()
 
@@ -1368,6 +1395,7 @@ if __name__ == "__main__":
   if args.serve:
     model.warmup()
     ASRHandler.model = model
+    ASRHandler.save_audio_dir = args.save_audio
     stderr_log(f"open http://localhost:{args.serve} for microphone transcription\n")
     server = TCPServerWithReuse(('', args.serve), ASRHandler)
     server.daemon_threads = True
