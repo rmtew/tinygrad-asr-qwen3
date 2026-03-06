@@ -712,7 +712,7 @@ ASR_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad ASR</title><style>
 <div id="drop">Drop audio file here</div>
 <script>
 const T = document.getElementById('transcript'), S = document.getElementById('status');
-let audioCtx, source, processor, pcmChunks, recording = false, sendTimer, sending = false;
+let audioCtx, source, processor, pcmChunks, recording = false, sendTimer, sending = false, queued = false;
 
 // Build a WAV blob from float32 PCM samples — no codec issues, always works
 function buildWav(samples, sr) {
@@ -770,15 +770,16 @@ function stopMic() {
 }
 
 async function sendPCM(isFinal) {
-  if (pcmChunks.length === 0 || sending) return;
+  if (pcmChunks.length === 0) return;
+  if (sending) { queued = isFinal ? 'final' : (queued || true); return; }
   sending = true;
   const samples = getPCM();
   const sr = audioCtx ? audioCtx.sampleRate : 16000;
-  const dur = (samples.length / sr).toFixed(1);
-  S.textContent = isFinal ? 'Transcribing...' : dur + 's...';
-  const wav = buildWav(samples, sr);
-  await transcribe(wav, 'recording.wav');
+  S.textContent = isFinal ? 'Transcribing...' : (samples.length / sr).toFixed(1) + 's...';
+  await transcribe(buildWav(samples, sr), 'recording.wav');
   sending = false;
+  // Catch up: if a send was requested while busy, fire immediately with latest audio
+  if (queued) { const fin = queued === 'final'; queued = false; sendPCM(fin); }
 }
 
 async function uploadFile(file) {
