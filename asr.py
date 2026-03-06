@@ -741,6 +741,11 @@ class StreamingSession:
     self.stagnant_chunks = 0
     self.hit_max_new = False  # did last decode hit max_new_tokens?
 
+    # Silence auto-commit: commit pending after N chunks with no new text
+    self.SILENCE_COMMIT_CHUNKS = 3   # ~6s of silence → auto-commit pending
+    self.last_committed_text = ""
+    self.silence_chunks = 0
+
     # Stats
     self.chunk_idx = 0
     self.total_reused = 0
@@ -834,6 +839,23 @@ class StreamingSession:
       self._is_final = True
       self._process_chunk()
 
+    # On final: commit all pending tokens (even if no chunk was processed)
+    if is_final:
+      text_start = 0
+      for i, t in enumerate(self.raw_tokens):
+        if t == TOKEN_ASR_TEXT: text_start = i + 1; break
+      text_tokens = self.raw_tokens[text_start:]
+      if len(text_tokens) > len(self.stable_text_tokens):
+        new_toks = text_tokens[len(self.stable_text_tokens):]
+        self.emitted_text += self.model.tok.decode(new_toks)
+        self.stable_text_tokens = list(text_tokens)
+      return {
+        "text": self.emitted_text.strip(),
+        "committed": self.emitted_text.strip(),
+        "pending": "",
+        "stats": self.last_stats,
+      }
+
     # Build display: committed text + pending (unfixed rollback tail)
     committed = self.emitted_text
     pending_text = ""
@@ -844,6 +866,25 @@ class StreamingSession:
     if len(text_tokens) > len(self.stable_text_tokens):
       pending_toks = text_tokens[len(self.stable_text_tokens):]
       pending_text = self.model.tok.decode(pending_toks)
+
+    # Silence auto-commit: if committed text hasn't changed for N chunks,
+    # promote pending to committed (user stopped speaking)
+    if pending_text:
+      if committed == self.last_committed_text:
+        self.silence_chunks += 1
+      else:
+        self.silence_chunks = 0
+        self.last_committed_text = committed
+      if self.silence_chunks >= self.SILENCE_COMMIT_CHUNKS:
+        self.emitted_text += pending_text
+        self.stable_text_tokens = list(text_tokens)
+        committed = self.emitted_text
+        pending_text = ""
+        self.silence_chunks = 0
+        self.last_committed_text = committed
+    else:
+      self.silence_chunks = 0
+      self.last_committed_text = committed
 
     return {
       "text": (committed + pending_text).strip(),
