@@ -22,37 +22,39 @@ For audio formats other than WAV, [ffmpeg](https://ffmpeg.org/) must be on PATH.
 ## Quick Start
 
 ```bash
-# Transcribe a file (auto-downloads model on first run)
-CUDA=1 python asr.py audio.wav
+# Transcribe a file (local GGUF)
+CUDA=1 python asr.py --model path/to/qwen3-asr-0.6b-f16.gguf audio.wav
+
+# Or download a known model
+CUDA=1 python asr.py --model qwen3-asr:0.6b audio.wav
 
 # Start server with web UI
-CUDA=1 JITBEAM=2 python asr.py --serve
+CUDA=1 JITBEAM=2 python asr.py --model path/to/qwen3-asr-0.6b-f16.gguf --serve
 # Open http://localhost:8090 in your browser
 ```
 
 ## Usage
 
+`--model` is required. Pass a path to a local GGUF file, or a known model name to download.
+
 ### CLI
 
 ```bash
 # Transcribe a WAV file
-python asr.py audio.wav
-
-# Use a local GGUF file
-python asr.py --model path/to/qwen3-asr-0.6b-f16.gguf audio.wav
+python asr.py --model model.gguf audio.wav
 
 # Interactive mode (type paths, get transcriptions)
-python asr.py
+python asr.py --model model.gguf
 ```
 
 ### Server + Web UI
 
 ```bash
 # Start on default port 8090
-python asr.py --serve
+python asr.py --model model.gguf --serve
 
 # Custom port
-python asr.py --serve 9000
+python asr.py --model model.gguf --serve 9000
 ```
 
 Open `http://localhost:8090` in your browser to get the transcription UI:

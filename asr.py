@@ -839,28 +839,30 @@ class ASRHandler(HTTPRequestHandler):
 # Model registry and CLI
 # ============================================================================
 
-models = {
+KNOWN_MODELS = {
   "qwen3-asr:0.6b": "https://huggingface.co/FlippyDora/qwen3-asr-0.6b-GGUF/resolve/main/qwen3-asr-0.6b-f16.gguf",
 }
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(description="Qwen3-ASR inference via tinygrad")
-  parser.add_argument("--model", "-m", default=list(models.keys())[0], help="Model name or path to GGUF file")
+  parser.add_argument("--model", "-m", required=True, help="Path to GGUF file, or model name to download (e.g. qwen3-asr:0.6b)")
   parser.add_argument("--serve", nargs='?', type=int, const=8090, metavar="PORT", help="Run OpenAI-compatible API server")
-  parser.add_argument("audio", nargs='?', help="WAV file to transcribe (interactive mode)")
+  parser.add_argument("audio", nargs='?', help="WAV file to transcribe (omit for interactive mode)")
   args = parser.parse_args()
 
-  # Load model
+  # Resolve model: local path > known model name (download)
   if os.path.exists(args.model):
-    gguf_path = args.model
-  elif args.model in models:
-    gguf_path = models[args.model]
+    stderr_log(f"loading {args.model}...\n")
+    raw = Tensor(pathlib.Path(args.model))
+  elif args.model in KNOWN_MODELS:
+    url = KNOWN_MODELS[args.model]
+    stderr_log(f"downloading {args.model} from {url}...\n")
+    raw = Tensor.from_url(url)
   else:
-    print(f"Unknown model: {args.model}. Available: {', '.join(models.keys())}")
+    print(f"Model not found: {args.model}")
+    print(f"  Pass a path to a GGUF file, or one of: {', '.join(KNOWN_MODELS.keys())}")
     sys.exit(1)
 
-  stderr_log(f"loading {gguf_path}...\n")
-  raw = Tensor(pathlib.Path(gguf_path)) if os.path.exists(gguf_path) else Tensor.from_url(gguf_path)
   model = ASR.from_gguf(raw)
   del raw
   import gc; gc.collect()
