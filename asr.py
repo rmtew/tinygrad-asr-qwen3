@@ -1106,6 +1106,7 @@ class ASRHandler(HTTPRequestHandler):
     elif self.path == '/health': self.send_data(b'{"status":"ok"}')
     elif self.path == '/v1/models':
       self.send_data(json.dumps({"data": [{"id": "qwen3-asr", "object": "model"}]}).encode())
+    elif self.path == '/favicon.ico': self.send_data(b'', content_type="image/x-icon")
     else: self.send_error(404)
 
   def do_POST(self):
