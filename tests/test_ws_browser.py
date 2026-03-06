@@ -5,7 +5,7 @@ Open: http://localhost:18091
 Ctrl+C to stop.
 """
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 class MockSession:
   def __init__(self):

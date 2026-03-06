@@ -11,6 +11,7 @@ Output:
   - Final text vs per-file reference comparison
 """
 import sys, os, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 os.environ.setdefault("CUDA", "1")
 os.environ.setdefault("CUDA_PTX", "1")
 

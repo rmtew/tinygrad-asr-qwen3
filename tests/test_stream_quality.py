@@ -10,6 +10,8 @@ Usage:
 """
 import sys, os, time, glob, struct, wave
 import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 os.environ.setdefault("CUDA", "1")
 os.environ.setdefault("CUDA_PTX", "1")
 

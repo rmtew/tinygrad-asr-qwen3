@@ -15,6 +15,7 @@ Usage:
 import sys, os, time, argparse, glob, pathlib, json, string
 import numpy as np
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 os.environ.setdefault('CUDA', '1')
 os.environ.setdefault('CUDA_PTX', '1')
 
@@ -124,40 +125,49 @@ def test_jfk_perfile(model, jfk_path: str, check_perf: bool) -> TestResult:
   return t
 
 
+def _stream_file(model, audio, chunk_sec=2.0):
+  """Run StreamingSession on audio, return result dict."""
+  from asr import StreamingSession
+  old_verbose = StreamingSession.verbose
+  StreamingSession.verbose = False
+  sess = StreamingSession(model, chunk_sec=chunk_sec)
+  chunk_samples = int(chunk_sec * SAMPLE_RATE)
+  pos = 0
+  t0 = time.time()
+  result = None
+  while pos < len(audio):
+    end = min(pos + chunk_samples, len(audio))
+    result = sess.feed(audio[pos:end], is_final=(end >= len(audio)))
+    pos = end
+  elapsed_ms = (time.time() - t0) * 1000
+  audio_sec = len(audio) / SAMPLE_RATE
+  StreamingSession.verbose = old_verbose
+  return {
+    "text": result["text"] if result else "",
+    "elapsed_ms": elapsed_ms,
+    "rtf": (elapsed_ms / 1000) / audio_sec if audio_sec > 0 else 0,
+    "chunks": sess.chunk_idx,
+  }
+
 def test_jfk_streaming(model, jfk_path: str, check_perf: bool) -> TestResult:
   """Streaming JFK transcription: correctness + optional perf."""
   from asr import load_audio, SAMPLE_RATE
   t = TestResult("JFK streaming transcription")
 
   audio = load_audio(jfk_path)
-  audio_sec = len(audio) / SAMPLE_RATE
 
   # Warm
-  model.transcribe_stream(audio)
+  _stream_file(model, audio)
 
   # Run
-  chunks_seen = []
-  def on_chunk(text, is_final):
-    chunks_seen.append((text, is_final))
-
-  result = model.transcribe_stream(audio, callback=on_chunk)
+  result = _stream_file(model, audio)
   text = result["text"]
   rtf = result["rtf"]
 
-  # Correctness: final text matches
   t.check("text match", normalize(text) == normalize(JFK_EXPECTED),
           f'got: "{text[:80]}..."' if normalize(text) != normalize(JFK_EXPECTED) else "exact match")
 
-  # Correctness: callback was called with is_final=True
-  t.check("final callback", any(is_final for _, is_final in chunks_seen),
-          f"{len(chunks_seen)} chunks, final={'yes' if any(f for _,f in chunks_seen) else 'no'}")
-
-  # Correctness: progressive chunks get longer (more text over time)
-  if len(chunks_seen) >= 2:
-    lengths = [len(txt) for txt, _ in chunks_seen]
-    growing = all(lengths[i] <= lengths[i+1] for i in range(len(lengths)-1))
-    # Not strictly required (streaming can fluctuate), but generally expected
-    t.check("progressive", True, f"chunk lengths: {lengths}")
+  t.check("chunks", result["chunks"] >= 3, f"{result['chunks']} chunks")
 
   if check_perf:
     t.check_le("RTF", rtf, BASELINES["jfk_stream_rtf"])
@@ -257,7 +267,7 @@ def test_librispeech_streaming(model, dataset_dir: str, n: int, warmup: int,
 
   # Warmup
   for f in audio_files[:warmup]:
-    model.transcribe_stream(load_audio(f))
+    _stream_file(model, load_audio(f))
 
   test_files = audio_files[warmup:warmup + n]
   total_errors, total_words = 0, 0
@@ -269,7 +279,7 @@ def test_librispeech_streaming(model, dataset_dir: str, n: int, warmup: int,
 
     audio = load_audio(fpath)
     audio_sec = len(audio) / SAMPLE_RATE
-    result = model.transcribe_stream(audio)
+    result = _stream_file(model, audio)
 
     errs, nwords = wer(ref_text, result["text"]) if ref_text else (0, 0)
     total_errors += errs

@@ -14,7 +14,7 @@ Usage:
 Requires: tinygrad (pip install tinygrad or local -e install)
 """
 from __future__ import annotations
-import sys, os, argparse, json, time, math, wave, struct, uuid, functools, pathlib, tempfile
+import sys, os, argparse, json, time, math, wave, functools, pathlib, tempfile
 import numpy as np
 
 # Windows CUDA workarounds (must run before tinygrad import):
@@ -31,7 +31,7 @@ if sys.platform == "win32":
   if not os.environ.get("CUDA_PTX"):
     os.environ["CUDA_PTX"] = "1"
 
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv
 from tinygrad.helpers import DEBUG, GlobalCounters, colored, stderr_log
 from tinygrad.apps.llm import Transformer, SimpleTokenizer, precompute_freqs_cis, apply_rope
 
@@ -522,160 +522,6 @@ class ASR:
 
     return {"text": text, "elapsed_ms": (time.time() - t0) * 1000}
 
-  def transcribe_stream(self, audio: np.ndarray, chunk_sec: float = 2.0,
-                         max_new_tokens: int = 64, max_enc_windows: int = 4,
-                         callback = None) -> dict:
-    """Streaming transcription: process audio in fixed-size chunks.
-
-    Each chunk encodes all audio heard so far (caching completed encoder windows)
-    and produces a COMPLETE transcription. The last chunk's output is the final result.
-    Intermediate results are delivered via callback for incremental display.
-
-    Args:
-      audio: float32 mono 16kHz samples
-      chunk_sec: seconds of audio per processing step (default 2.0)
-      max_new_tokens: max tokens decoded per chunk
-      max_enc_windows: sliding window limit for encoder cache
-      callback: optional fn(text_so_far, is_final) called after each chunk
-
-    Returns: {"text": str, "elapsed_ms": float, "audio_sec": float, "rtf": float}
-    """
-    t0 = time.time()
-    audio_sec = len(audio) / SAMPLE_RATE
-    chunk_samples = int(chunk_sec * SAMPLE_RATE)
-    dim = self.encoder.output_dim
-    enc_window_frames = 800  # 8s of audio per encoder window
-    enc_window_samples = enc_window_frames * HOP_LENGTH
-
-    # Encoder window cache: list of Tensor (realized encoder outputs for complete windows)
-    enc_cache: list[Tensor] = []
-    next_window_start = 0  # sample index of next full window boundary
-
-    # KV cache reuse: save previous chunk's prompt embeddings for comparison
-    prev_embeds: np.ndarray | None = None  # [prev_prompt_len, dim] numpy
-    prev_prompt_len = 0
-
-    audio_cursor = 0
-    chunk_idx = 0
-    last_text = ""
-    total_enc_ms, total_prefill_ms, total_decode_ms = 0.0, 0.0, 0.0
-    total_reused_tokens = 0
-
-    while audio_cursor < len(audio):
-      audio_cursor = min(audio_cursor + chunk_samples, len(audio))
-      is_final = audio_cursor >= len(audio)
-
-      # --- Encoder: cache completed windows, re-encode partial tail ---
-      t_enc = time.time()
-      full_end = (audio_cursor // enc_window_samples) * enc_window_samples
-
-      # Encode any new complete windows
-      while next_window_start < full_end:
-        ws = next_window_start
-        window_mel = compute_mel(audio[ws:ws + enc_window_samples])
-        bucket = self.encoder.chunk_size * 8
-        padded = ((window_mel.shape[1] + bucket - 1) // bucket) * bucket
-        if padded > window_mel.shape[1]:
-          window_mel = np.pad(window_mel, ((0, 0), (0, padded - window_mel.shape[1])))
-        enc_out = self.encoder.forward(window_mel[:, :padded]).realize()
-        actual_tokens = enc_window_frames // 8
-        enc_cache.append(enc_out[:actual_tokens])
-        next_window_start += enc_window_samples
-
-      # Encode partial tail (from last full window boundary to audio_cursor)
-      partial_enc = None
-      if full_end < audio_cursor:
-        partial_mel = compute_mel(audio[int(full_end):audio_cursor])
-        bucket = self.encoder.chunk_size * 8
-        padded = ((partial_mel.shape[1] + bucket - 1) // bucket) * bucket
-        if padded > partial_mel.shape[1]:
-          partial_mel = np.pad(partial_mel, ((0, 0), (0, padded - partial_mel.shape[1])))
-        partial_out = self.encoder.forward(partial_mel[:, :padded]).realize()
-        actual_partial = max(1, (audio_cursor - int(full_end)) // HOP_LENGTH // 8)
-        partial_enc = partial_out[:actual_partial]
-
-      # Evict old encoder windows (sliding window for long audio)
-      while len(enc_cache) > max_enc_windows:
-        enc_cache.pop(0)
-
-      # Concatenate encoder outputs: cached windows + partial tail
-      enc_parts = list(enc_cache) + ([partial_enc] if partial_enc is not None else [])
-      if not enc_parts: chunk_idx += 1; continue
-      audio_embeds = Tensor.cat(*enc_parts, dim=0) if len(enc_parts) > 1 else enc_parts[0]
-      enc_ms = (time.time() - t_enc) * 1000
-      total_enc_ms += enc_ms
-
-      # --- Prefill with KV cache reuse ---
-      # Compare current embeddings with previous chunk to find reuse point.
-      # Positions 0..reuse_point have identical KV cache entries — skip them.
-      t_pf = time.time()
-      combined = Tensor.cat(self._prefix_embeds, audio_embeds, self._suffix_embeds, dim=0).reshape(1, -1, dim)
-      prompt_len = combined.shape[1]
-      assert prompt_len <= self._embed_buf.shape[1], f"prompt_len {prompt_len} > max_context"
-
-      # Write full embeddings to buffer (needed for both reuse comparison and prefill)
-      self._embed_buf[:, :prompt_len].assign(combined.contiguous()).realize()
-      cur_embeds = self._embed_buf[0, :prompt_len].numpy()  # [prompt_len, dim]
-
-      # Find longest matching prefix with previous chunk
-      reuse_point = 0
-      if prev_embeds is not None:
-        cmp_len = min(prompt_len, prev_prompt_len)
-        row_bytes = dim * 4  # float32
-        for i in range(cmp_len):
-          if not np.array_equal(cur_embeds[i], prev_embeds[i]): break
-          reuse_point = i + 1
-
-      # Prefill only the delta tokens (from reuse_point to prompt_len)
-      delta = prompt_len - reuse_point
-      if delta > 0:
-        sp_b, nt_b = self.v_sp.bind(reuse_point), self.v_nt.bind(delta)
-        out = self.decoder.prefill_embed_jit(self._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
-        token = int(out.item())
-      else:
-        # Entire prompt is unchanged — just re-decode from the last prefill output
-        # (This shouldn't happen in practice since at least the partial tail changes)
-        sp_b, nt_b = self.v_sp.bind(0), self.v_nt.bind(prompt_len)
-        out = self.decoder.prefill_embed_jit(self._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
-        token = int(out.item())
-
-      # Save embeddings for next chunk's comparison
-      prev_embeds = cur_embeds.copy()
-      prev_prompt_len = prompt_len
-      total_reused_tokens += reuse_point
-
-      prefill_ms = (time.time() - t_pf) * 1000
-      total_prefill_ms += prefill_ms
-
-      # --- Decode until EOS or max_new_tokens ---
-      t_dec = time.time()
-      chunk_tokens = [token]
-      for step in range(max_new_tokens - 1):
-        if token in EOS_TOKEN_IDS: break
-        pos = prompt_len + step
-        out = self.decoder(Tensor([[token]]), self.v_dec_pos.bind(pos))
-        token = int(out.item())
-        chunk_tokens.append(token)
-      decode_ms = (time.time() - t_dec) * 1000
-      total_decode_ms += decode_ms
-
-      # Extract text from this chunk's full transcription
-      while chunk_tokens and chunk_tokens[-1] in EOS_TOKEN_IDS: chunk_tokens.pop()
-      if TOKEN_ASR_TEXT in chunk_tokens:
-        chunk_tokens = chunk_tokens[chunk_tokens.index(TOKEN_ASR_TEXT) + 1:]
-      last_text = self.tok.decode(chunk_tokens).strip()
-      chunk_idx += 1
-
-      if callback: callback(last_text, is_final)
-
-    total_ms = (time.time() - t0) * 1000
-    rtf = (total_ms / 1000) / audio_sec if audio_sec > 0 else 0
-    stderr_log(f"stream: {audio_sec:.1f}s audio, {chunk_idx} chunks, "
-               f"enc={total_enc_ms:.0f}ms, prefill={total_prefill_ms:.0f}ms, "
-               f"decode={total_decode_ms:.0f}ms, total={total_ms:.0f}ms, RTF={rtf:.2f}, "
-               f"kv_reused={total_reused_tokens}\n")
-
-    return {"text": last_text, "elapsed_ms": total_ms, "audio_sec": audio_sec, "rtf": rtf}
 
 # ============================================================================
 # StreamingSession: server-side state for incremental live transcription
@@ -1148,8 +994,6 @@ class ASRHandler(HTTPRequestHandler):
   def do_POST(self):
     if self.path == '/v1/audio/transcriptions':
       self._handle_transcribe()
-    elif self.path.startswith('/v1/audio/stream'):
-      self._handle_stream()
     else:
       self.send_error(404)
 
@@ -1175,60 +1019,6 @@ class ASRHandler(HTTPRequestHandler):
     finally:
       os.unlink(tmp_path)
 
-  def _handle_stream(self):
-    """Streaming transcription: client sends audio deltas, server maintains session state.
-
-    POST /v1/audio/stream?action=start  -> reset session
-    POST /v1/audio/stream?action=feed   -> body: WAV delta, returns {"text": "..."}
-    POST /v1/audio/stream?action=end    -> process remaining audio, clear session
-    """
-    from urllib.parse import urlparse, parse_qs
-    params = parse_qs(urlparse(self.path).query)
-    action = params.get('action', ['feed'])[0]
-
-    if action == 'start':
-      ASRHandler.session = StreamingSession(self.model)
-      stderr_log("stream session started\n")
-      self.send_data(json.dumps({"text": "", "status": "started"}).encode())
-      return
-
-    if ASRHandler.session is None:
-      # Auto-start if no explicit start
-      ASRHandler.session = StreamingSession(self.model)
-      stderr_log("stream session auto-started\n")
-
-    if action in ('feed', 'end'):
-      body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
-      content_type = self.headers.get('Content-Type', '')
-
-      # Extract and decode audio delta
-      audio = np.array([], dtype=np.float32)
-      if len(body) > 0:
-        audio_data, filename = self._extract_audio(body, content_type)
-        if audio_data and len(audio_data) > 0:
-          suffix = os.path.splitext(filename)[1] if filename else '.wav'
-          if not suffix or suffix == '.': suffix = '.wav'
-          with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-            f.write(audio_data)
-            tmp_path = f.name
-          try:
-            audio = load_audio(tmp_path)
-          finally:
-            os.unlink(tmp_path)
-
-      is_final = action == 'end'
-      result = ASRHandler.session.feed(audio, is_final=is_final)
-
-      resp = {"text": result["text"], "committed": result["committed"], "pending": result["pending"], "stats": result.get("stats", {})}
-      if is_final:
-        ASRHandler.session = None
-        resp["status"] = "done"
-        resp["committed"] = result["text"]
-        resp["pending"] = ""
-        stderr_log("stream session ended\n")
-
-      self.send_data(json.dumps(resp).encode())
-      return
 
     self.send_error(400, f"Unknown action: {action}")
 

@@ -4,7 +4,7 @@ Starts a mock server (no model loading), exercises the WS protocol.
 """
 import asyncio, json, time, os, sys, tempfile, shutil
 import numpy as np
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 class MockSession:
   def __init__(self):

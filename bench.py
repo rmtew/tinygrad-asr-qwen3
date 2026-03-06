@@ -13,7 +13,27 @@ os.environ.setdefault('CUDA_PTX', '1')
 
 from tinygrad import Tensor
 from tinygrad.helpers import stderr_log, colored
-from asr import ASR, load_audio, compute_mel, SAMPLE_RATE
+from asr import ASR, StreamingSession, load_audio, compute_mel, SAMPLE_RATE
+
+def _stream_file(model, audio, chunk_sec=2.0):
+  """Run StreamingSession on audio, return result dict."""
+  StreamingSession.verbose = False
+  sess = StreamingSession(model, chunk_sec=chunk_sec)
+  chunk_samples = int(chunk_sec * SAMPLE_RATE)
+  pos = 0
+  t0 = time.time()
+  result = None
+  while pos < len(audio):
+    end = min(pos + chunk_samples, len(audio))
+    result = sess.feed(audio[pos:end], is_final=(end >= len(audio)))
+    pos = end
+  elapsed_ms = (time.time() - t0) * 1000
+  audio_sec = len(audio) / SAMPLE_RATE
+  return {
+    "text": result["text"] if result else "",
+    "elapsed_ms": elapsed_ms,
+    "rtf": (elapsed_ms / 1000) / audio_sec if audio_sec > 0 else 0,
+  }
 
 def load_refs(dataset_dir: str) -> dict[str, str]:
   """Load reference transcriptions from LibriSpeech .trans.txt files."""
@@ -77,8 +97,7 @@ if __name__ == "__main__":
     # Warmup with a few files in streaming mode
     print(f"\nWarming up ({args.warmup} files in stream mode)...")
     for f in audio_files[:args.warmup]:
-      audio = load_audio(f)
-      model.transcribe_stream(audio)
+      _stream_file(model, load_audio(f))
     print("Warmup done.\n")
 
     total_errors, total_words = 0, 0
@@ -91,7 +110,7 @@ if __name__ == "__main__":
       audio = load_audio(fpath)
       audio_sec = len(audio) / SAMPLE_RATE
 
-      result = model.transcribe_stream(audio)
+      result = _stream_file(model, audio)
       hyp_text = result["text"]
       proc_ms = result["elapsed_ms"]
 
