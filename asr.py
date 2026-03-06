@@ -16,6 +16,21 @@ Requires: tinygrad (pip install tinygrad or local -e install)
 from __future__ import annotations
 import sys, os, argparse, json, time, math, wave, struct, uuid, functools, pathlib, tempfile
 import numpy as np
+
+# Windows CUDA workarounds (must run before tinygrad import):
+# 1. Auto-detect CUDA_PATH from versioned env vars (CUDA_PATH_V13_1 etc.)
+#    so nvrtc can find cuda_fp16.h
+# 2. Default to PTX compilation (CUDA_PTX=1) — avoids CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+#    when CUDA toolkit is newer than the driver (e.g. toolkit 13.1, driver supports 13.0)
+if sys.platform == "win32":
+  if not os.environ.get("CUDA_PATH"):
+    for key, val in os.environ.items():
+      if key.startswith("CUDA_PATH_V") and os.path.isdir(val):
+        os.environ["CUDA_PATH"] = val
+        break
+  if not os.environ.get("CUDA_PTX"):
+    os.environ["CUDA_PTX"] = "1"
+
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.helpers import DEBUG, GlobalCounters, colored, stderr_log
 from tinygrad.apps.llm import Transformer, SimpleTokenizer, precompute_freqs_cis, apply_rope
