@@ -1019,9 +1019,6 @@ class ASRHandler(HTTPRequestHandler):
     finally:
       os.unlink(tmp_path)
 
-
-    self.send_error(400, f"Unknown action: {action}")
-
   def _extract_audio(self, body: bytes, content_type: str) -> tuple[bytes | None, str]:
     """Extract audio bytes and filename from multipart/form-data or raw body."""
     if 'multipart/form-data' not in content_type:
