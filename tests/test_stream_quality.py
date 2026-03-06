@@ -8,7 +8,7 @@ Usage:
   py test_stream_quality.py              # run all tests
   py test_stream_quality.py --noisy      # include noise-degraded tests
 """
-import sys, os, time, glob, struct, wave
+import sys, os, glob, wave
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -164,7 +164,7 @@ if __name__ == "__main__":
 
   # --- Summary ---
   print(f"\n{'='*70}")
-  print(f"  SUMMARY")
+  print("  SUMMARY")
   print(f"  {'Test':<30s} {'Stream WER':>12s} {'Per-file WER':>14s} {'Gap':>8s}")
   for name, swer, pwer in results:
     print(f"  {name:<30s} {swer:>11.1f}% {pwer:>13.1f}% {swer-pwer:>+7.1f}%")

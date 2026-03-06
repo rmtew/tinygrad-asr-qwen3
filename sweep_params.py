@@ -10,7 +10,6 @@ Usage:
   py sweep_params.py --all-audio   # use captures/ + known test files
 """
 import sys, os, time, argparse, glob
-import numpy as np
 os.environ.setdefault("CUDA", "1")
 os.environ.setdefault("CUDA_PTX", "1")
 
@@ -109,7 +108,7 @@ def print_results(results, audio_files):
       print(row)
 
     # RTF table
-    print(f"\n  RTF (processing_time / audio_duration):")
+    print("\n  RTF (processing_time / audio_duration):")
     for cs in chunk_secs:
       row = f"  {cs:>8.0f}s  "
       for rb in rollbacks:
@@ -120,7 +119,7 @@ def print_results(results, audio_files):
 
   # Overall best combos
   print(f"\n{'='*70}")
-  print(f"  BEST COMBINATIONS (averaged across files)")
+  print("  BEST COMBINATIONS (averaged across files)")
   print(f"{'='*70}")
 
   combos = {}

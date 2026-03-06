@@ -12,8 +12,7 @@ Full benchmarks (~5min):
 Usage:
   python test.py [--quick] [--full] [--perf] [--model PATH] [--dataset PATH] [--verbose]
 """
-import sys, os, time, argparse, glob, pathlib, json, string
-import numpy as np
+import sys, os, time, argparse, glob, pathlib, string
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 os.environ.setdefault('CUDA', '1')
@@ -127,7 +126,7 @@ def test_jfk_perfile(model, jfk_path: str, check_perf: bool) -> TestResult:
 
 def _stream_file(model, audio, chunk_sec=2.0):
   """Run StreamingSession on audio, return result dict."""
-  from asr import StreamingSession
+  from asr import StreamingSession, SAMPLE_RATE
   old_verbose = StreamingSession.verbose
   StreamingSession.verbose = False
   sess = StreamingSession(model, chunk_sec=chunk_sec)
@@ -151,7 +150,7 @@ def _stream_file(model, audio, chunk_sec=2.0):
 
 def test_jfk_streaming(model, jfk_path: str, check_perf: bool) -> TestResult:
   """Streaming JFK transcription: correctness + optional perf."""
-  from asr import load_audio, SAMPLE_RATE
+  from asr import load_audio
   t = TestResult("JFK streaming transcription")
 
   audio = load_audio(jfk_path)
@@ -250,7 +249,7 @@ def test_librispeech_perfile(model, dataset_dir: str, n: int, warmup: int,
   if check_perf:
     t.check_le("RTF", overall_rtf, BASELINES["perfile_rtf"])
   else:
-    t.check(f"RTF (info)", True, f"{overall_rtf:.3f} ({1/overall_rtf:.1f}x RT)")
+    t.check("RTF (info)", True, f"{overall_rtf:.3f} ({1/overall_rtf:.1f}x RT)")
 
   return t
 
@@ -299,7 +298,7 @@ def test_librispeech_streaming(model, dataset_dir: str, n: int, warmup: int,
   if check_perf:
     t.check_le("RTF", overall_rtf, BASELINES["stream_rtf"])
   else:
-    t.check(f"RTF (info)", True, f"{overall_rtf:.3f} ({1/overall_rtf:.1f}x RT)")
+    t.check("RTF (info)", True, f"{overall_rtf:.3f} ({1/overall_rtf:.1f}x RT)")
 
   return t
 
@@ -358,7 +357,7 @@ if __name__ == "__main__":
       print(results[-1].summary())
 
   # --- Disk cache info ---
-  print(f"\n--- Disk cache ---")
+  print("\n--- Disk cache ---")
   try:
     import sqlite3
     from tinygrad.helpers import CACHEDB

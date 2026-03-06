@@ -2,7 +2,7 @@
 
 Starts a mock server (no model loading), exercises the WS protocol.
 """
-import asyncio, json, time, os, sys, tempfile, shutil
+import asyncio, json, os, sys, tempfile, shutil
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
@@ -44,7 +44,7 @@ async def run_tests():
       await ws.send(json.dumps({"type": "start"}))
       resp = json.loads(await ws.recv())
       assert resp["status"] == "started", resp
-      print(f"  start: OK")
+      print("  start: OK")
 
       for i in range(2):
         samples = np.zeros(16000, dtype=np.int16)

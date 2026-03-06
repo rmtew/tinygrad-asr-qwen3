@@ -46,7 +46,7 @@ def test_session(model, audio_path, chunk_sec=2.0):
   print(result["text"])
 
   # Compare with per-file transcription
-  print(f"\n--- Per-file reference ---")
+  print("\n--- Per-file reference ---")
   ref = model.transcribe(audio_path)
   print(ref["text"])
 

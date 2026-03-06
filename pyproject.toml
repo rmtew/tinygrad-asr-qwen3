@@ -1,0 +1,33 @@
+[project]
+name = "tinygrad-asr-qwen3"
+requires-python = ">=3.12"
+dependencies = ["tinygrad", "websockets"]
+
+[project.optional-dependencies]
+dev = ["ruff"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+  "E401",    # multiple imports on one line — intentional compact style
+  "E402",    # module-level import not at top — needed for env vars, sys.path
+  "E501",    # line too long — handled by formatter with line-length
+  "E701",    # multiple statements on one line (colon) — compact style
+  "E702",    # multiple statements on one line (semicolon) — compact style
+  "E731",    # lambda assignment — used for brevity
+  "F841",    # local assigned but unused — some intentional (timing vars)
+  "B007",    # unused loop variable — common in index-only loops
+  "B905",    # zip() without strict= — not needed for equal-length lists
+  "SIM108",  # ternary instead of if/else — readability preference
+  "SIM115",  # context manager for open — one-shot reads are fine
+  "UP015",   # redundant open mode — keep explicit for clarity
+  "RUF001",  # ambiguous unicode (×) — intentional in display strings
+  "RUF003",  # ambiguous unicode in comments — intentional
+  "RUF005",  # consider unpacking — [X] + list(Y) is clearer
+  "RUF012",  # mutable class default — intentional for class-level config
+  "I001",    # import sorting — not enforcing import order
+]

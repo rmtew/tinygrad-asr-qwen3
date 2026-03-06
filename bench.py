@@ -6,14 +6,12 @@ Usage:
 
 Reports: WER, RTF, tok/s, and per-utterance timing.
 """
-import sys, os, time, argparse, glob, pathlib
-import numpy as np
+import os, time, argparse, glob, pathlib
 os.environ.setdefault('CUDA', '1')
 os.environ.setdefault('CUDA_PTX', '1')
 
 from tinygrad import Tensor
-from tinygrad.helpers import stderr_log, colored
-from asr import ASR, StreamingSession, load_audio, compute_mel, SAMPLE_RATE
+from asr import ASR, StreamingSession, load_audio, SAMPLE_RATE
 
 def _stream_file(model, audio, chunk_sec=2.0):
   """Run StreamingSession on audio, return result dict."""

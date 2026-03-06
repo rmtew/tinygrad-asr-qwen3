@@ -13,7 +13,6 @@ Usage:
 
 Requires: tinygrad (pip install tinygrad or local -e install)
 """
-from __future__ import annotations
 import sys, os, argparse, json, time, math, wave, functools, pathlib, tempfile
 import numpy as np
 
@@ -32,8 +31,8 @@ if sys.platform == "win32":
     os.environ["CUDA_PTX"] = "1"
 
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv
-from tinygrad.helpers import DEBUG, GlobalCounters, colored, stderr_log
-from tinygrad.apps.llm import Transformer, SimpleTokenizer, precompute_freqs_cis, apply_rope
+from tinygrad.helpers import colored, stderr_log
+from tinygrad.apps.llm import Transformer, SimpleTokenizer
 
 # ============================================================================
 # Constants
@@ -218,7 +217,7 @@ class AudioEncoder:
       x = self.conv1(chunk_mel).gelu()
       x = self.conv2(x).gelu()
       x = self.conv3(x).gelu()
-      b, c, f, t = x.shape
+      _, c, f, t = x.shape
       chunk_outputs.append(x.permute(0, 3, 1, 2).reshape(1, t, c * f).squeeze(0))  # [time, conv_ch * freq]
 
     x = self.conv_out(Tensor.cat(*chunk_outputs, dim=0))  # [total_tokens, d_model]
@@ -346,7 +345,7 @@ class ASR:
     self.v_dec_pos = UOp.variable("asr_dec_pos", 1, decoder.max_context - 1)
 
   @staticmethod
-  def from_gguf(gguf_tensor: Tensor) -> ASR:
+  def from_gguf(gguf_tensor: Tensor) -> 'ASR':
     """Load ASR model from a GGUF tensor (FlippyDora F16 format)."""
     kv, state_dict = nn.state.gguf_load(gguf_tensor.to(None).realize())
     arch = kv['general.architecture']

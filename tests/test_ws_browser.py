@@ -38,7 +38,7 @@ WS_PORT = HTTP_PORT + 1
 ws_server = start_ws_server("mock", WS_PORT)
 print(f"HTTP:      http://localhost:{HTTP_PORT}", flush=True)
 print(f"WebSocket: ws://localhost:{WS_PORT}", flush=True)
-print(f"Ctrl+C to stop\n", flush=True)
+print("Ctrl+C to stop\n", flush=True)
 
 server = TCPServerWithReuse(("", HTTP_PORT), ASRHandler)
 server.daemon_threads = True
