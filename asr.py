@@ -847,140 +847,7 @@ class StreamingSession:
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
 # Self-contained HTML page: microphone capture + live transcription display
-ASR_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad ASR</title><style>
-  * { margin: 0; box-sizing: border-box }
-  body { background: #212121; color: #e3e3e3; font-family: system-ui;
-         height: 100vh; display: flex; flex-direction: column; align-items: center }
-  h1 { padding: 20px; font-size: 1.1em; color: #888 }
-  #transcript { flex: 1; overflow-y: auto; padding: 20px; max-width: 768px; width: 100%;
-                font-size: 1.3em; line-height: 1.7; white-space: pre-wrap }
-  #transcript:empty::after { content: "Click Record or drop an audio file"; color: #555 }
-  #controls { padding: 20px; display: flex; gap: 12px; align-items: center }
-  button { padding: 12px 24px; border-radius: 24px; border: none;
-           font: inherit; cursor: pointer; background: #2f2f2f; color: #e3e3e3 }
-  button:hover { background: #3f3f3f }
-  #mic.on { background: #c62828; color: white }
-  #status { color: #888; font-size: 0.85em; min-width: 100px }
-  #drop { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none;
-          align-items: center; justify-content: center; font-size: 2em; color: #aaa; z-index: 10 }
-</style></head><body>
-<h1>tinygrad qwen3-asr</h1>
-<div id="transcript"></div>
-<div id="controls">
-  <button id="mic" onclick="toggleMic()">Record</button>
-  <button onclick="document.getElementById('filepick').click()">Upload file</button>
-  <input type="file" id="filepick" accept="audio/*" style="display:none" onchange="uploadFile(this.files[0])">
-  <span id="status"></span>
-</div>
-<div id="drop">Drop audio file here</div>
-<script>
-const T = document.getElementById('transcript'), S = document.getElementById('status');
-let audioCtx, source, processor, pcmChunks, recording = false, sendTimer, sending = false, queued = false;
-let sentChunkIdx = 0, totalSent = 0;
-
-// Build a WAV blob from float32 PCM samples - no codec issues, always works
-function buildWav(samples, sr) {
-  const n = samples.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
-  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  w(0,'RIFF'); v.setUint32(4, 36+n*2, true); w(8,'WAVE'); w(12,'fmt ');
-  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
-  v.setUint32(24,sr,true); v.setUint32(28,sr*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
-  w(36,'data'); v.setUint32(40, n*2, true);
-  for (let i = 0; i < n; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    v.setInt16(44 + i*2, s < 0 ? s*0x8000 : s*0x7FFF, true);
-  }
-  return new Blob([buf], { type: 'audio/wav' });
-}
-
-// Get only NEW pcm samples since last send (delta)
-function getDeltaPCM() {
-  const newChunks = pcmChunks.slice(sentChunkIdx);
-  sentChunkIdx = pcmChunks.length;
-  let len = 0;
-  for (const c of newChunks) len += c.length;
-  const out = new Float32Array(len);
-  let off = 0;
-  for (const c of newChunks) { out.set(c, off); off += c.length; }
-  totalSent += len;
-  return out;
-}
-
-async function toggleMic() {
-  if (recording) { stopMic(); return; }
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    audioCtx = new AudioContext({ sampleRate: 16000 });
-    source = audioCtx.createMediaStreamSource(stream);
-    // ScriptProcessorNode captures raw PCM - no codec, no container format issues
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    pcmChunks = []; sentChunkIdx = 0; totalSent = 0;
-    processor.onaudioprocess = e => pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-    recording = true;
-    document.getElementById('mic').textContent = 'Stop';
-    document.getElementById('mic').className = 'on';
-    S.textContent = 'Listening...';
-    // Tell server to start a new streaming session
-    await fetch('/v1/audio/stream?action=start', { method: 'POST' });
-    sendTimer = setInterval(() => sendDelta(false), 2000);
-  } catch(e) { S.textContent = 'Mic error: ' + e.message; }
-}
-
-function stopMic() {
-  clearInterval(sendTimer);
-  processor.disconnect(); source.disconnect();
-  source.mediaStream.getTracks().forEach(t => t.stop());
-  audioCtx.close();
-  recording = false;
-  document.getElementById('mic').textContent = 'Record';
-  document.getElementById('mic').className = '';
-  sendDelta(true);
-}
-
-async function sendDelta(isFinal) {
-  const delta = getDeltaPCM();
-  if (delta.length === 0 && !isFinal) return;
-  if (sending) { queued = isFinal ? 'final' : (queued || true); return; }
-  sending = true;
-  const sr = audioCtx ? audioCtx.sampleRate : 16000;
-  const dur = (totalSent / sr).toFixed(1);
-  S.textContent = isFinal ? 'Transcribing...' : dur + 's...';
-  const action = isFinal ? 'end' : 'feed';
-  const fd = new FormData();
-  fd.append('file', buildWav(delta, sr), 'chunk.wav');
-  try {
-    const r = await fetch('/v1/audio/stream?action=' + action, { method: 'POST', body: fd });
-    const d = await r.json();
-    T.textContent = d.text;
-    if (!recording) S.textContent = d.status === 'done' ? '' : '';
-  } catch(e) { S.textContent = 'Error: ' + e.message; }
-  sending = false;
-  if (queued) { const fin = queued === 'final'; queued = false; sendDelta(fin); }
-}
-
-async function uploadFile(file) {
-  if (!file) return;
-  S.textContent = 'Transcribing ' + file.name + '...';
-  const fd = new FormData();
-  fd.append('file', file, file.name);
-  try {
-    const r = await fetch('/v1/audio/transcriptions', { method: 'POST', body: fd });
-    const d = await r.json();
-    T.textContent = d.text;
-    S.textContent = '';
-  } catch(e) { S.textContent = 'Error: ' + e.message; }
-}
-
-// Drag and drop
-document.addEventListener('dragover', e => { e.preventDefault(); document.getElementById('drop').style.display = 'flex'; });
-document.addEventListener('dragleave', e => { if (e.relatedTarget === null) document.getElementById('drop').style.display = 'none'; });
-document.addEventListener('drop', e => {
-  e.preventDefault(); document.getElementById('drop').style.display = 'none';
-  if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
-});
-</script></body></html>'''
+_HTML_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class ASRHandler(HTTPRequestHandler):
   model: ASR  # set before serving
@@ -989,7 +856,10 @@ class ASRHandler(HTTPRequestHandler):
   def log_request(self, code='-', size='-'): pass
 
   def do_GET(self):
-    if self.path == '/': self.send_data(ASR_HTML, content_type="text/html")
+    if self.path == '/':
+      html_path = os.path.join(_HTML_DIR, 'index.html')
+      try: self.send_data(open(html_path, 'rb').read(), content_type="text/html")
+      except FileNotFoundError: self.send_error(404, "index.html not found")
     elif self.path == '/health': self.send_data(b'{"status":"ok"}')
     elif self.path == '/v1/models':
       self.send_data(json.dumps({"data": [{"id": "qwen3-asr", "object": "model"}]}).encode())
