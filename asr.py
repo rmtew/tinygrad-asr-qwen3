@@ -663,83 +663,177 @@ class ASR:
     return {"text": last_text, "elapsed_ms": total_ms, "audio_sec": audio_sec, "rtf": rtf}
 
 # ============================================================================
-# OpenAI-compatible server: /v1/audio/transcriptions
+# OpenAI-compatible server with live microphone transcription
 # ============================================================================
 
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
+# Self-contained HTML page: microphone capture + live transcription display
+ASR_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad ASR</title><style>
+  * { margin: 0; box-sizing: border-box }
+  body { background: #212121; color: #e3e3e3; font-family: system-ui;
+         height: 100vh; display: flex; flex-direction: column; align-items: center }
+  h1 { padding: 20px; font-size: 1.1em; color: #888 }
+  #transcript { flex: 1; overflow-y: auto; padding: 20px; max-width: 768px; width: 100%;
+                font-size: 1.3em; line-height: 1.7; white-space: pre-wrap }
+  #transcript:empty::after { content: "Click Record or drop an audio file"; color: #555 }
+  #controls { padding: 20px; display: flex; gap: 12px; align-items: center }
+  button { padding: 12px 24px; border-radius: 24px; border: none;
+           font: inherit; cursor: pointer; background: #2f2f2f; color: #e3e3e3 }
+  button:hover { background: #3f3f3f }
+  #mic.on { background: #c62828; color: white }
+  #status { color: #888; font-size: 0.85em; min-width: 100px }
+  #drop { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none;
+          align-items: center; justify-content: center; font-size: 2em; color: #aaa; z-index: 10 }
+</style></head><body>
+<h1>tinygrad qwen3-asr</h1>
+<div id="transcript"></div>
+<div id="controls">
+  <button id="mic" onclick="toggleMic()">Record</button>
+  <button onclick="document.getElementById('filepick').click()">Upload file</button>
+  <input type="file" id="filepick" accept="audio/*" style="display:none" onchange="uploadFile(this.files[0])">
+  <span id="status"></span>
+</div>
+<div id="drop">Drop audio file here</div>
+<script>
+const T = document.getElementById('transcript'), S = document.getElementById('status');
+let mediaRec, chunks = [], recording = false, sendTimer;
+
+async function toggleMic() {
+  if (recording) { stopMic(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+    mediaRec = new MediaRecorder(stream);
+    chunks = [];
+    mediaRec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    mediaRec.start(500);
+    recording = true;
+    document.getElementById('mic').textContent = 'Stop';
+    document.getElementById('mic').className = 'on';
+    S.textContent = 'Listening...';
+    // Send accumulated audio every 2s for live transcription
+    sendTimer = setInterval(() => sendChunks(false), 2000);
+  } catch(e) { S.textContent = 'Mic error: ' + e.message; }
+}
+
+function stopMic() {
+  clearInterval(sendTimer);
+  mediaRec.stop();
+  mediaRec.stream.getTracks().forEach(t => t.stop());
+  recording = false;
+  document.getElementById('mic').textContent = 'Record';
+  document.getElementById('mic').className = '';
+  // Final transcription with all audio
+  setTimeout(() => sendChunks(true), 600);
+}
+
+async function sendChunks(isFinal) {
+  if (chunks.length === 0) return;
+  const blob = new Blob(chunks, { type: mediaRec.mimeType || 'audio/webm' });
+  await transcribe(blob, isFinal ? 'recording.webm' : null);
+}
+
+async function uploadFile(file) {
+  if (!file) return;
+  S.textContent = 'Transcribing ' + file.name + '...';
+  await transcribe(file, file.name);
+}
+
+async function transcribe(blob, filename) {
+  const fd = new FormData();
+  fd.append('file', blob, filename || 'audio.webm');
+  S.textContent = 'Transcribing...';
+  try {
+    const r = await fetch('/v1/audio/transcriptions', { method: 'POST', body: fd });
+    const d = await r.json();
+    T.textContent = d.text;
+    S.textContent = '';
+  } catch(e) { S.textContent = 'Error: ' + e.message; }
+}
+
+// Drag and drop
+document.addEventListener('dragover', e => { e.preventDefault(); document.getElementById('drop').style.display = 'flex'; });
+document.addEventListener('dragleave', e => { if (e.relatedTarget === null) document.getElementById('drop').style.display = 'none'; });
+document.addEventListener('drop', e => {
+  e.preventDefault(); document.getElementById('drop').style.display = 'none';
+  if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
+});
+</script></body></html>'''
+
 class ASRHandler(HTTPRequestHandler):
-  model: ASR  # set by main before serving
+  model: ASR  # set before serving
 
   def log_request(self, code='-', size='-'): pass
 
   def do_GET(self):
-    if self.path == '/health':
-      self.send_data(b'{"status":"ok"}')
+    if self.path == '/': self.send_data(ASR_HTML, content_type="text/html")
+    elif self.path == '/health': self.send_data(b'{"status":"ok"}')
     elif self.path == '/v1/models':
       self.send_data(json.dumps({"data": [{"id": "qwen3-asr", "object": "model"}]}).encode())
-    else:
-      self.send_error(404)
+    else: self.send_error(404)
 
   def do_POST(self):
     if self.path != '/v1/audio/transcriptions':
-      self.send_error(404)
-      return
+      self.send_error(404); return
 
+    body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
     content_type = self.headers.get('Content-Type', '')
-    content_length = int(self.headers.get('Content-Length', 0))
-    body = self.rfile.read(content_length)
-
-    # Parse multipart form data to extract the audio file
-    audio_data = self._extract_audio(body, content_type)
+    audio_data, filename = self._extract_audio(body, content_type)
     if audio_data is None:
-      self.send_error(400, "No audio file found in request")
-      return
+      self.send_error(400, "No audio file found"); return
 
-    # Write to temp file and transcribe
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+    # Detect format from filename, default to .bin (ffmpeg auto-detects)
+    suffix = os.path.splitext(filename)[1] if filename else '.bin'
+    if not suffix or suffix == '.': suffix = '.webm'
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
       f.write(audio_data)
       tmp_path = f.name
-
     try:
-      result = self.model.transcribe(tmp_path)
+      audio = load_audio(tmp_path)
+      audio_sec = len(audio) / SAMPLE_RATE
+      # Use streaming for long audio (>32s), per-file for short
+      if audio_sec > 32:
+        result = self.model.transcribe_stream(audio)
+      else:
+        result = self.model.transcribe(tmp_path)
       self.send_data(json.dumps({"text": result["text"]}).encode())
+    except Exception as e:
+      self.send_data(json.dumps({"error": str(e)}).encode(), status_code=500)
     finally:
       os.unlink(tmp_path)
 
-  def _extract_audio(self, body: bytes, content_type: str) -> bytes | None:
-    """Extract audio file bytes from multipart/form-data."""
-    if 'multipart/form-data' not in content_type: return body  # assume raw audio
+  def _extract_audio(self, body: bytes, content_type: str) -> tuple[bytes | None, str]:
+    """Extract audio bytes and filename from multipart/form-data or raw body."""
+    if 'multipart/form-data' not in content_type:
+      return (body, ''), ''
+
     # Find boundary
+    boundary = None
     for part in content_type.split(';'):
       part = part.strip()
       if part.startswith('boundary='):
         boundary = part[9:].strip('"').encode()
-        break
-    else:
-      return None
+    if boundary is None: return None, ''
 
-    # Split on boundary and find the file part
-    parts = body.split(b'--' + boundary)
-    for part in parts:
-      if b'name="file"' in part or b'name="audio"' in part:
-        # Find the blank line separating headers from body
-        idx = part.find(b'\r\n\r\n')
-        if idx >= 0:
-          data = part[idx + 4:]
-          # Strip trailing \r\n-- if present
-          if data.endswith(b'\r\n'): data = data[:-2]
-          if data.endswith(b'--'): data = data[:-2]
-          if data.endswith(b'\r\n'): data = data[:-2]
-          return data
-    return None
-
-  def send_data(self, data: bytes, content_type: str = "application/json"):
-    self.send_response(200)
-    self.send_header("Content-Type", content_type)
-    self.send_header("Content-Length", str(len(data)))
-    self.end_headers()
-    self.wfile.write(data)
+    # Find file part
+    for part in body.split(b'--' + boundary):
+      if b'name="file"' not in part and b'name="audio"' not in part: continue
+      # Extract filename from Content-Disposition
+      filename = ''
+      for line in part.split(b'\r\n'):
+        if b'filename=' in line:
+          fn = line.split(b'filename=')[1].split(b';')[0].strip(b' "\'')
+          filename = fn.decode(errors='replace')
+      # Extract body after blank line
+      idx = part.find(b'\r\n\r\n')
+      if idx < 0: continue
+      data = part[idx + 4:]
+      if data.endswith(b'\r\n'): data = data[:-2]
+      if data.endswith(b'--'): data = data[:-2]
+      if data.endswith(b'\r\n'): data = data[:-2]
+      return data, filename
+    return None, ''
 
 # ============================================================================
 # Model registry and CLI
@@ -772,8 +866,9 @@ if __name__ == "__main__":
   import gc; gc.collect()
 
   if args.serve:
+    model.warmup()
     ASRHandler.model = model
-    stderr_log(f"serving on http://localhost:{args.serve}/v1/audio/transcriptions\n")
+    stderr_log(f"open http://localhost:{args.serve} for microphone transcription\n")
     TCPServerWithReuse(('', args.serve), ASRHandler).serve_forever()
   elif args.audio:
     result = model.transcribe(args.audio)
