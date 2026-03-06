@@ -7,8 +7,10 @@ Qwen3-ASR speech recognition via [tinygrad](https://github.com/tinygrad/tinygrad
 - Loads GGUF models (F16/F32) via tinygrad's built-in `gguf_load`
 - Reuses tinygrad's `Transformer` for the decoder — no duplicated code
 - OpenAI-compatible `/v1/audio/transcriptions` endpoint
-- Web UI with live microphone transcription and file drag-and-drop
-- Streaming mode for long audio (2s chunks, sliding window, KV cache reuse)
+- Web UI with live microphone transcription (WebSocket), file drag-and-drop
+- Committed/pending confidence display — stable text vs. provisional rollback tail
+- Streaming with text prefix feedback, rollback commit, stagnation recovery
+- Browser noise suppression (WebRTC `noiseSuppression`, `echoCancellation`, `autoGainControl`)
 - GPU accelerated (CUDA, etc.)
 
 ## Install
@@ -58,12 +60,13 @@ python asr.py --model model.gguf --serve 9000
 ```
 
 Open `http://localhost:8090` in your browser to get the transcription UI:
-- **Record** — click to start/stop microphone recording. Transcription updates live every 2 seconds while recording.
-- **Upload file** — or drag-and-drop an audio file onto the page.
-
-Audio longer than 32 seconds automatically uses streaming mode (2s chunks with encoder window caching and decoder KV cache reuse).
+- **Record** — click to start/stop microphone recording. Audio streams to the server over WebSocket. Transcription updates live every 2 seconds. Committed text appears in white; the provisional rollback tail appears in dim italic.
+- **Upload file** — or drag-and-drop an audio file onto the page for one-shot transcription.
+- **Stats panel** — shows RTF, latency breakdown (encoder/prefill/decode), encoder windows, KV cache reuse, committed/pending token counts.
 
 ### API
+
+One-shot file transcription (OpenAI-compatible):
 
 ```bash
 curl -X POST http://localhost:8090/v1/audio/transcriptions \
@@ -77,17 +80,42 @@ result = client.audio.transcriptions.create(model="qwen3-asr", file=open("audio.
 print(result.text)
 ```
 
+Streaming via WebSocket (`/ws`):
+
+```
+Client → Server:
+  Text frame:   {"type":"start"}           → create session
+  Binary frame: Int16 LE PCM (16kHz mono)  → feed audio chunk
+  Text frame:   {"type":"end"}             → finalize
+
+Server → Client:
+  Text frame:   {"committed":"...","pending":"...","stats":{...}}
+```
+
+Streaming via HTTP (stateful session):
+
+```bash
+# Start session
+curl -X POST http://localhost:8090/v1/audio/stream?action=start
+
+# Feed audio deltas (multipart WAV)
+curl -X POST http://localhost:8090/v1/audio/stream?action=feed -F "file=@chunk.wav"
+
+# End session
+curl -X POST http://localhost:8090/v1/audio/stream?action=end
+```
+
 ## Performance
 
 With `JITBEAM=2` on an RTX 3070 Ti Laptop (warm, JIT cached):
 
-| Mode | Audio | RTF | Notes |
-|------|-------|-----|-------|
-| Per-file | 11s (JFK) | **0.05** | Encoder 109ms, total 591ms |
-| Per-file | LibriSpeech 30-utt | **0.07** | WER 0.65% |
-| Streaming | 11s (JFK, 6 chunks) | **0.16** | KV cache reuse: 245 tokens |
-| Streaming | LibriSpeech 30-utt | **0.20** | WER 2.10% |
-| Streaming | 119s (movie clip) | **0.16** | Sequential encoder, 19 windows |
+| Mode | Audio | RTF | WER | Notes |
+|------|-------|-----|-----|-------|
+| Per-file | 11s (JFK) | **0.05** | — | Encoder 109ms, total 591ms |
+| Per-file | LibriSpeech 30-utt | **0.07** | **0.65%** | |
+| Streaming | 11s (JFK, 6 chunks) | **0.16** | **0.0%** | KV cache reuse: 245 tokens |
+| Streaming | LibriSpeech 30-utt | **0.20** | **2.10%** | |
+| Streaming | 119s (movie clip) | **0.16** | ~9% | Sequential encoder, 19 windows |
 
 ### JITBEAM and Disk Cache
 
@@ -122,13 +150,19 @@ CUDA=1 JITBEAM=2 python test.py --perf
 
 # Full benchmark: 30-file LibriSpeech WER + RTF (per-file and streaming)
 CUDA=1 JITBEAM=2 python test.py --full
+
+# Streaming session diagnostics (feed() with per-chunk logging)
+python test_session.py path/to/audio.wav
+
+# Streaming vs per-file WER comparison
+python test_stream_quality.py
 ```
 
 ## Models
 
 | Model | Size | Source |
 |-------|------|--------|
-| `qwen3-asr:0.6b` (default) | 1.88 GB | [FlippyDora/qwen3-asr-0.6b-GGUF](https://huggingface.co/FlippyDora/qwen3-asr-0.6b-GGUF) |
+| `qwen3-asr:0.6b` | 1.88 GB | [FlippyDora/qwen3-asr-0.6b-GGUF](https://huggingface.co/FlippyDora/qwen3-asr-0.6b-GGUF) |
 
 ## Architecture
 
@@ -142,11 +176,14 @@ The GGUF contains both encoder and decoder weights. The state dict is split by p
 
 ### Streaming
 
-For long audio, `transcribe_stream` processes 2-second chunks:
-- Encoder windows cached per chunk (no re-encoding earlier chunks)
-- Decoder KV cache reused across chunks (row-by-row embedding comparison finds longest matching prefix)
-- Sliding window eviction keeps max 4 encoder windows (32s context)
-- Each chunk produces a complete transcription of all audio heard so far
+`StreamingSession` implements C-style streaming (matching `qwen_asr.c stream_impl`):
+
+- **2s chunks** — audio arrives as PCM deltas via WebSocket (or HTTP)
+- **Encoder window cache** — completed 8s windows cached, only partial tail re-encoded each chunk. Max 4 windows (32s sliding context)
+- **Decoder KV cache reuse** — row-by-row embedding comparison finds longest matching prefix (~245 tokens reused for 11s audio)
+- **Text prefix feedback** — previous decoded tokens (minus rollback) fed back as decoder context, anchoring output after encoder windows are evicted
+- **Monotonic commit** — LCP against previous stable tokens, overlap dedup, emit only new tokens. Committed text never removed
+- **Recovery** — stagnation detection (4+ chunks with no advance), degenerate repeat detection, periodic reset every 45 chunks (~90s). Resets KV cache and text state but preserves encoder cache
 
 ## Requirements
 
