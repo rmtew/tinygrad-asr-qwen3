@@ -844,12 +844,12 @@ class ASRHandler(HTTPRequestHandler):
       rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) > 0 else 0
       stderr_log(f"recv: {len(audio_data)} bytes {suffix}, {audio_sec:.1f}s {len(audio)} samples, RMS={rms:.4f}\n")
       if rms < 0.001:
-        stderr_log(f"WARNING: audio RMS near zero — likely silence or corrupt file\n")
-      # Use streaming for long audio (>32s), per-file for short
-      if audio_sec > 32:
-        result = self.model.transcribe_stream(audio)
-      else:
-        result = self.model.transcribe(tmp_path)
+        stderr_log(f"WARNING: audio RMS near zero -- likely silence or corrupt file\n")
+      # Always use per-file mode for HTTP requests. Each request is stateless,
+      # so transcribe_stream would re-process all chunks from scratch (6x slower).
+      # Per-file does one encoder pass + one prefill + one decode, scales fine
+      # to minutes of audio via the two-path encoder (sequential for >32s).
+      result = self.model.transcribe(tmp_path)
       self.send_data(json.dumps({"text": result["text"]}).encode())
     except Exception as e:
       self.send_data(json.dumps({"error": str(e)}).encode(), status_code=500)
