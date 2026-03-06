@@ -741,10 +741,10 @@ class StreamingSession:
     self.stagnant_chunks = 0
     self.hit_max_new = False  # did last decode hit max_new_tokens?
 
-    # Silence auto-commit: commit pending after N chunks with no new text
-    self.SILENCE_COMMIT_CHUNKS = 3   # ~6s of silence → auto-commit pending
-    self.last_committed_text = ""
-    self.silence_chunks = 0
+    # Silence auto-commit: if pending is stable for N chunks, commit it
+    self.SILENCE_COMMIT_CHUNKS = 3   # ~6s of stable pending → auto-commit
+    self.prev_pending_tokens: list[int] = []
+    self.pending_stable_chunks = 0
 
     # Stats
     self.chunk_idx = 0
@@ -866,25 +866,6 @@ class StreamingSession:
     if len(text_tokens) > len(self.stable_text_tokens):
       pending_toks = text_tokens[len(self.stable_text_tokens):]
       pending_text = self.model.tok.decode(pending_toks)
-
-    # Silence auto-commit: if committed text hasn't changed for N chunks,
-    # promote pending to committed (user stopped speaking)
-    if pending_text:
-      if committed == self.last_committed_text:
-        self.silence_chunks += 1
-      else:
-        self.silence_chunks = 0
-        self.last_committed_text = committed
-      if self.silence_chunks >= self.SILENCE_COMMIT_CHUNKS:
-        self.emitted_text += pending_text
-        self.stable_text_tokens = list(text_tokens)
-        committed = self.emitted_text
-        pending_text = ""
-        self.silence_chunks = 0
-        self.last_committed_text = committed
-    else:
-      self.silence_chunks = 0
-      self.last_committed_text = committed
 
     return {
       "text": (committed + pending_text).strip(),
@@ -1020,6 +1001,17 @@ class StreamingSession:
       if candidate_len <= 0 and n_text > 0: candidate_len = n_text - 1
     else:
       candidate_len = 0
+
+    # Silence auto-commit: if the pending (rollback) tail is identical for
+    # N consecutive chunks, it's stable — commit it all
+    pending_tokens = text_tokens[candidate_len:]
+    if pending_tokens and pending_tokens == self.prev_pending_tokens:
+      self.pending_stable_chunks += 1
+    else:
+      self.pending_stable_chunks = 0
+    self.prev_pending_tokens = list(pending_tokens)
+    if self.pending_stable_chunks >= self.SILENCE_COMMIT_CHUNKS and not self._is_final:
+      candidate_len = n_text  # commit everything including rollback tail
 
     candidate = text_tokens[:candidate_len]
     did_recovery = False
