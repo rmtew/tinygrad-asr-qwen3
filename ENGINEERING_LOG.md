@@ -119,6 +119,22 @@ saved = (out1[:,:2] + 0).realize()          # ✅ independent copy
 
 ---
 
+## Two-path encoder: batched JIT + sequential fallback
+
+**Problem:** The encoder used one-JIT-per-bucket-size. Unseen bucket sizes (e.g., 180,000 frames for 30min audio) triggered JITBEAM compilation that could take hours. Even within LibriSpeech, a 16.8s file hitting the 2400-frame bucket for the first time added a 4.5s outlier.
+
+**Solution:** Two JIT paths:
+- **Batched JIT** for pre-warmed bucket sizes (800/1600/2400/3200, covering ≤32s): processes all windows in one JIT call with batched attention. Fast, pre-compiled.
+- **Sequential single-window JIT** for any other size: splits into 800-frame windows, encodes each through the pre-warmed single-window JIT. No compilation surprises. Scales to any length.
+
+Both produce identical output because attention is windowed — no cross-window dependencies. Verified numerically (max diff = 0.000000).
+
+**JITBEAM disk caching:** Beam search results are cached in `~/.cache/tinygrad/cache.db` (sqlite, keyed by kernel AST hash + device). First-ever run pays full beam search cost (~11min for all buckets). Subsequent runs hit cache (~65s warmup — just JIT graph capture). Cache is versioned by tinygrad version; no automatic eviction within a version.
+
+**Result:** Per-file RTF improved 0.089 → 0.070 (no compilation outliers). 119s audio file: encoder 98ms via 19 sequential single-window calls, RTF=0.16.
+
+---
+
 ## Performance summary (RTX 3070 Laptop, 0.6B model, JFK 11s)
 
 | Stage | No JIT | + Decoder JIT | + JITBEAM=2 | + Encoder JIT | C impl |
