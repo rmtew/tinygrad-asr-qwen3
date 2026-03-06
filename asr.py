@@ -1251,7 +1251,7 @@ def _save_session_audio(chunks: list[np.ndarray], save_dir: str | None):
   except Exception as e:
     stderr_log(f"save-audio error: {e}\n")
 
-def start_ws_server(model: ASR, port: int, save_audio_dir: str | None = None):
+def start_ws_server(model: ASR, port: int, save_audio_dir: str | None = None, run_in_background: bool = True):
   """Start WebSocket server on a separate port using the `websockets` library.
 
   Protocol:
@@ -1303,13 +1303,15 @@ def start_ws_server(model: ASR, port: int, save_audio_dir: str | None = None):
     async with serve(ws_handler, "0.0.0.0", port) as server:
       await server.serve_forever()
 
-  loop = asyncio.new_event_loop()
-  t = threading.Thread(target=loop.run_until_complete, args=(run(),), daemon=True)
-  t.start()
-
-  class _Shutdown:
-    def shutdown(self): loop.call_soon_threadsafe(loop.stop)
-  return _Shutdown()
+  if run_in_background:
+    loop = asyncio.new_event_loop()
+    t = threading.Thread(target=loop.run_until_complete, args=(run(),), daemon=True)
+    t.start()
+    class _Shutdown:
+      def shutdown(self): loop.call_soon_threadsafe(loop.stop)
+    return _Shutdown()
+  else:
+    asyncio.run(run())
 
 # ============================================================================
 # Model registry and CLI
@@ -1349,13 +1351,17 @@ if __name__ == "__main__":
     ASRHandler.model = model
     ASRHandler.save_audio_dir = args.save_audio
     ws_port = args.serve + 1
-    ws_server = start_ws_server(model, ws_port, args.save_audio)
+    # HTTP in background thread (stateless endpoints)
+    http_server = TCPServerWithReuse(('', args.serve), ASRHandler)
+    http_server.daemon_threads = True
+    import threading
+    http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+    http_thread.start()
     stderr_log(f"open http://localhost:{args.serve} for microphone transcription\n")
     stderr_log(f"websocket on ws://localhost:{ws_port}\n")
-    server = TCPServerWithReuse(('', args.serve), ASRHandler)
-    server.daemon_threads = True
-    try: server.serve_forever()
-    except KeyboardInterrupt: stderr_log("shutting down\n"); server.server_close(); ws_server.shutdown()
+    # WS in main thread — tinygrad's SQLite cache is thread-local
+    try: start_ws_server(model, ws_port, args.save_audio, run_in_background=False)
+    except KeyboardInterrupt: stderr_log("shutting down\n"); http_server.server_close()
   elif args.audio:
     result = model.transcribe(args.audio)
     print(result["text"])
