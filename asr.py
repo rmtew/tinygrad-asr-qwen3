@@ -895,9 +895,11 @@ class StreamingSession:
       lcp += 1
 
     # Emit delta: new tokens from lcp to candidate_len
+    n_emitted_before = len(self.emitted_text)
     if lcp < candidate_len:
       new_tokens = candidate[lcp:]
       self.emitted_text += model.tok.decode(new_tokens)
+    emit_delta = self.emitted_text[n_emitted_before:]
 
     self.stable_text_tokens = list(candidate)
 
@@ -922,10 +924,22 @@ class StreamingSession:
       "pending": n_text - candidate_len,
       "prefix_fed": len(prefix_toks),
     }
-    stderr_log(f"chunk {self.chunk_idx}: {audio_sec:.1f}s, "
-               f"enc={enc_ms:.0f}ms, prefill={prefill_ms:.0f}ms ({reuse_point} reused), "
-               f"decode={decode_ms:.0f}ms ({len(chunk_tokens)} tok), "
-               f"committed={len(self.stable_text_tokens)}, prefix={len(prefix_toks)}\n")
+
+    # --- Diagnostic log ---
+    # Decode what the model actually produced this chunk (raw continuation)
+    decode_text = model.tok.decode(chunk_tokens).replace('\n', ' ')
+    # Pending tail (unfixed tokens not yet committed)
+    pending_text = model.tok.decode(text_tokens[candidate_len:]) if candidate_len < n_text else ""
+    stderr_log(
+      f"chunk {self.chunk_idx}: {audio_sec:.1f}s  "
+      f"enc={enc_ms:.0f}ms prefill={prefill_ms:.0f}ms({reuse_point}kv) decode={decode_ms:.0f}ms({len(chunk_tokens)}tok)  "
+      f"win={len(self.enc_cache)}/{self.max_enc_windows} prefix={len(prefix_toks)} raw={len(self.raw_tokens)}\n"
+      f"  decoded : {decode_text!r}\n"
+      f"  commit  : lcp={lcp}/{len(self.stable_text_tokens)} candidate={candidate_len} "
+      f"emit={candidate_len - lcp}tok emitted_total={len(self.stable_text_tokens)}\n"
+      f"  +emit   : {emit_delta!r}\n"
+      f"  pending : {pending_text!r}\n"
+    )
 
 # ============================================================================
 # OpenAI-compatible server with live microphone transcription
