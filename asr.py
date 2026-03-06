@@ -709,13 +709,14 @@ class StreamingSession:
     self.prev_embeds: np.ndarray | None = None
     self.prev_prompt_len = 0
 
-    # Result
+    # Result and stats
     self.last_text = ""
     self.chunk_idx = 0
     self.total_reused = 0
+    self.last_stats: dict = {}
 
-  def feed(self, new_audio: np.ndarray, is_final: bool = False) -> str:
-    """Feed new audio samples. Processes complete 2s chunks, returns current text."""
+  def feed(self, new_audio: np.ndarray, is_final: bool = False) -> dict:
+    """Feed new audio samples. Returns {"text": ..., "stats": ...}."""
     if len(new_audio) > 0:
       self.tail_audio = np.append(self.tail_audio, new_audio)
       self.total_samples += len(new_audio)
@@ -728,7 +729,7 @@ class StreamingSession:
     if is_final and len(self.tail_audio) > 0:
       self._process_up_to(self.total_samples)
 
-    return self.last_text
+    return {"text": self.last_text, "stats": self.last_stats}
 
   def _process_up_to(self, target_sample: int):
     """Run encoder + prefill + decode for audio up to target_sample."""
@@ -835,7 +836,23 @@ class StreamingSession:
     self.last_text = model.tok.decode(tokens).strip()
     self.chunk_idx += 1
 
+    total_ms = enc_ms + prefill_ms + decode_ms
     audio_sec = self.total_samples / SAMPLE_RATE
+    rtf = (total_ms / 1000) / audio_sec if audio_sec > 0 else 0
+    self.last_stats = {
+      "audio_sec": round(audio_sec, 1),
+      "chunk": self.chunk_idx,
+      "enc_ms": round(enc_ms),
+      "prefill_ms": round(prefill_ms),
+      "decode_ms": round(decode_ms),
+      "total_ms": round(total_ms),
+      "rtf": round(rtf, 3),
+      "reused": reuse_point,
+      "prompt_len": prompt_len,
+      "enc_windows": len(self.enc_cache),
+      "max_windows": self.max_enc_windows,
+      "decode_tokens": len(tokens),
+    }
     stderr_log(f"chunk {self.chunk_idx}: {audio_sec:.1f}s total, "
                f"enc={enc_ms:.0f}ms, prefill={prefill_ms:.0f}ms ({reuse_point} reused), "
                f"decode={decode_ms:.0f}ms ({len(tokens)} tok)\n")
@@ -937,9 +954,9 @@ class ASRHandler(HTTPRequestHandler):
             os.unlink(tmp_path)
 
       is_final = action == 'end'
-      text = ASRHandler.session.feed(audio, is_final=is_final)
+      result = ASRHandler.session.feed(audio, is_final=is_final)
 
-      resp = {"text": text}
+      resp = {"text": result["text"], "stats": result.get("stats", {})}
       if is_final:
         ASRHandler.session = None
         resp["status"] = "done"

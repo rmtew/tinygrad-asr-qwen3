@@ -14,6 +14,15 @@
   #status { color: #888; font-size: 0.85em; min-width: 100px }
   #drop { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none;
           align-items: center; justify-content: center; font-size: 2em; color: #aaa; z-index: 10 }
+
+  /* Stats panel */
+  #stats { max-width: 768px; width: 100%; padding: 0 20px 16px; display: none; font-size: 0.8em }
+  #level-wrap { height: 4px; background: #333; border-radius: 2px; margin-bottom: 8px; overflow: hidden }
+  #level { height: 100%; width: 0; background: #4caf50; transition: width 0.1s; border-radius: 2px }
+  #stat-line { display: flex; gap: 16px; color: #777; flex-wrap: wrap }
+  #stat-line .val { color: #aaa }
+  #stat-detail { display: flex; gap: 16px; color: #555; margin-top: 4px; flex-wrap: wrap }
+  #stat-detail .val { color: #777 }
 </style></head><body>
 <h1>tinygrad qwen3-asr</h1>
 <div id="transcript"></div>
@@ -23,11 +32,20 @@
   <input type="file" id="filepick" accept="audio/*" style="display:none" onchange="uploadFile(this.files[0])">
   <span id="status"></span>
 </div>
+<div id="stats">
+  <div id="level-wrap"><div id="level"></div></div>
+  <div id="stat-line"></div>
+  <div id="stat-detail"></div>
+</div>
 <div id="drop">Drop audio file here</div>
 <script>
 const T = document.getElementById('transcript'), S = document.getElementById('status');
+const statsEl = document.getElementById('stats');
+const levelEl = document.getElementById('level');
+const statLine = document.getElementById('stat-line');
+const statDetail = document.getElementById('stat-detail');
 let audioCtx, source, processor, pcmChunks, recording = false, sendTimer, sending = false, queued = false;
-let sentChunkIdx = 0, totalSent = 0;
+let sentChunkIdx = 0, totalSent = 0, currentRMS = 0;
 
 // Build a WAV blob from float32 PCM samples — no codec issues, always works
 function buildWav(samples, sr) {
@@ -57,6 +75,27 @@ function getDeltaPCM() {
   return out;
 }
 
+function stat(label, value) { return `${label} <span class="val">${value}</span>`; }
+
+function updateStats(s) {
+  if (!s || !s.chunk) { statLine.innerHTML = ''; statDetail.innerHTML = ''; return; }
+  const rtfColor = s.rtf < 0.2 ? '#4caf50' : s.rtf < 0.5 ? '#ff9800' : '#f44336';
+  statLine.innerHTML = [
+    stat('⏱', s.audio_sec + 's'),
+    stat('RTF', `<span style="color:${rtfColor}">${s.rtf.toFixed(2)}</span>`),
+    stat('latency', s.total_ms + 'ms'),
+    stat('windows', s.enc_windows + '/' + s.max_windows),
+    stat('reused', s.reused + '/' + s.prompt_len),
+  ].join('');
+  statDetail.innerHTML = [
+    stat('enc', s.enc_ms + 'ms'),
+    stat('prefill', s.prefill_ms + 'ms'),
+    stat('decode', s.decode_ms + 'ms'),
+    stat('tokens', s.decode_tokens),
+    stat('chunk', '#' + s.chunk),
+  ].join('');
+}
+
 async function toggleMic() {
   if (recording) { stopMic(); return; }
   try {
@@ -66,12 +105,24 @@ async function toggleMic() {
     // ScriptProcessorNode captures raw PCM — no codec, no container format issues
     processor = audioCtx.createScriptProcessor(4096, 1, 1);
     pcmChunks = []; sentChunkIdx = 0; totalSent = 0;
-    processor.onaudioprocess = e => pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    processor.onaudioprocess = e => {
+      const data = e.inputBuffer.getChannelData(0);
+      pcmChunks.push(new Float32Array(data));
+      // Compute RMS for level meter
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+      currentRMS = Math.sqrt(sum / data.length);
+      // Map RMS to percentage (0.0–0.3 range typical for speech)
+      const pct = Math.min(100, (currentRMS / 0.15) * 100);
+      levelEl.style.width = pct + '%';
+      levelEl.style.background = pct > 60 ? '#ff9800' : '#4caf50';
+    };
     source.connect(processor);
     processor.connect(audioCtx.destination);
     recording = true;
     document.getElementById('mic').textContent = 'Stop';
     document.getElementById('mic').className = 'on';
+    statsEl.style.display = 'block';
     S.textContent = 'Listening...';
     // Tell server to start a new streaming session
     await fetch('/v1/audio/stream?action=start', { method: 'POST' });
@@ -87,6 +138,7 @@ function stopMic() {
   recording = false;
   document.getElementById('mic').textContent = 'Record';
   document.getElementById('mic').className = '';
+  levelEl.style.width = '0';
   sendDelta(true);
 }
 
@@ -105,7 +157,8 @@ async function sendDelta(isFinal) {
     const r = await fetch('/v1/audio/stream?action=' + action, { method: 'POST', body: fd });
     const d = await r.json();
     T.textContent = d.text;
-    if (!recording) S.textContent = d.status === 'done' ? '' : '';
+    if (d.stats) updateStats(d.stats);
+    if (!recording) S.textContent = '';
   } catch(e) { S.textContent = 'Error: ' + e.message; }
   sending = false;
   if (queued) { const fin = queued === 'final'; queued = false; sendDelta(fin); }
@@ -114,6 +167,7 @@ async function sendDelta(isFinal) {
 async function uploadFile(file) {
   if (!file) return;
   S.textContent = 'Transcribing ' + file.name + '...';
+  statsEl.style.display = 'none';
   const fd = new FormData();
   fd.append('file', file, file.name);
   try {
