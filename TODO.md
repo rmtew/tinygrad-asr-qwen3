@@ -9,6 +9,8 @@
 - ~~**Diagnostic logging.**~~ Per-chunk server log: decoded text, LCP/commit flow, emit delta, pending tail, recovery events. Correlates browser sessions to quality issues.
 - ~~**Quality test infrastructure.**~~ `test_stream_quality.py`: streaming vs per-file WER on clean, noisy, real mic audio. `test_session.py`: diagnostic harness for StreamingSession.feed().
 - ~~**Browser noise suppression.**~~ `getUserMedia` with `noiseSuppression`, `echoCancellation`, `autoGainControl`.
+- ~~**WebSocket streaming.**~~ Replaces HTTP polling. Binary Int16 PCM frames, JSON responses. Lower overhead per chunk.
+- ~~**Confidence display.**~~ Committed text (bright) vs pending rollback tail (dim italic) in web UI.
 
 ## Streaming Quality
 
@@ -41,5 +43,3 @@ Current streaming WER gap vs per-file (per-file is 0%):
 ## Features
 
 - **Server-side noise reduction.** `noisereduce` (spectral gating) or simple high-pass filter (~200-300Hz) to remove fan/ambient noise before ASR. Browser noiseSuppression helps but server-side would catch upload-file path too.
-- **WebSocket streaming.** Replace HTTP polling with WebSocket for lower latency mic transcription.
-- **Confidence/partial display.** Show committed text in normal weight, pending (unfixed rollback tail) in lighter color so user can see what's stable vs. provisional.
