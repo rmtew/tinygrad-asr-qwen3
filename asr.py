@@ -721,16 +721,99 @@ class StreamingSession:
     # Text prefix feedback (C-style streaming)
     self.raw_tokens: list[int] = []       # full decoded tokens (lang + text_marker + text)
     self.stable_text_tokens: list[int] = []  # candidate tokens from last commit
+    self.emitted_text_tokens: list[int] = [] # all emitted token IDs (for overlap dedup)
     self.emitted_text: str = ""           # accumulated committed text (grows monotonically)
     self.rollback = 5                     # unfixed tail tokens
     self.unfixed_chunks = 2               # first N chunks: no prefix feedback
     self.max_prefix_tokens = 150          # bound prefix length in prompt
+
+    # Constants matching C implementation
+    self.MAX_REPEAT_TOKEN_RUN = 12   # suppress runs longer than this
+    self.OVERLAP_MAX_TOKENS = 48     # max overlap check window
+    self.OVERLAP_MIN_TOKENS = 4      # min overlap to trigger dedup
+    self.DEGEN_MAX_PERIOD = 6        # max repeat block period to check
+    self.DEGEN_MIN_REPEATS = 4       # min repeats to trigger recovery
+    self.STALE_CHUNKS = 4            # stagnant chunks before recovery
+    self.RESET_INTERVAL_CHUNKS = 45  # periodic reset every N chunks
+    self.RESET_CARRY_TOKENS = 24     # tokens to carry through reset
+
+    # Stagnation tracking
+    self.stagnant_chunks = 0
+    self.hit_max_new = False  # did last decode hit max_new_tokens?
 
     # Stats
     self.chunk_idx = 0
     self.total_reused = 0
     self.last_stats: dict = {}
     self._is_final = False
+
+  # --- Recovery helpers (matching C implementation) ---
+
+  @staticmethod
+  def _tail_repeat_blocks(tokens: list[int], max_period: int) -> tuple[int, int]:
+    """Detect repeating block pattern at tail of token list.
+    Returns (best_reps, best_period). E.g. [A,B,A,B,A,B] → (3, 2)."""
+    n = len(tokens)
+    if n < 2: return 1, 0
+    best_reps, best_period = 1, 0
+    period_cap = min(n // 2, max_period) if max_period > 0 else n // 2
+    for p in range(1, period_cap + 1):
+      reps = 1
+      while (reps + 1) * p <= n:
+        a = tokens[n - (reps + 1) * p : n - reps * p]
+        b = tokens[n - reps * p : n]
+        if len(a) != p or a != b[:p]: break
+        reps += 1
+      if reps > best_reps:
+        best_reps, best_period = reps, p
+    return best_reps, best_period
+
+  def _suppress_repeats(self, chunk_tokens: list[int]) -> tuple[list[int], int]:
+    """Filter out tokens repeating > MAX_REPEAT_TOKEN_RUN times, continuing
+    the run count from the end of raw_tokens[:n_prefix_full]."""
+    if not chunk_tokens: return chunk_tokens, 0
+    # Seed run from end of prefix
+    n_prefix_full = max(0, len(self.raw_tokens) - self.rollback) if self.chunk_idx >= self.unfixed_chunks else 0
+    prev_tok, prev_run = -1, 0
+    if n_prefix_full > 0:
+      prev_tok = self.raw_tokens[n_prefix_full - 1]
+      prev_run = 1
+      for j in range(n_prefix_full - 2, -1, -1):
+        if self.raw_tokens[j] != prev_tok: break
+        prev_run += 1
+        if prev_run >= self.MAX_REPEAT_TOKEN_RUN: break
+
+    out, dropped = [], 0
+    for tok in chunk_tokens:
+      if tok == prev_tok:
+        prev_run += 1
+        if prev_run > self.MAX_REPEAT_TOKEN_RUN:
+          dropped += 1; continue
+      else:
+        prev_tok, prev_run = tok, 1
+      out.append(tok)
+    return out, dropped
+
+  def _reanchor(self):
+    """Recovery reset: rebuild raw_tokens from emitted history, reset KV cache.
+
+    Unlike the C implementation which clears the encoder cache (it retains
+    the full audio buffer and re-encodes), we preserve encoder windows because
+    audio arrives incrementally via feed() — clearing would lose all context.
+    Only the decoder text state and KV cache are reset."""
+    carry = min(len(self.emitted_text_tokens), self.RESET_CARRY_TOKENS)
+    tail = self.emitted_text_tokens[-carry:] if carry > 0 else []
+
+    # Rebuild raw_tokens: [<asr_text>] + last N emitted text tokens
+    self.raw_tokens = [TOKEN_ASR_TEXT] + list(tail)
+    self.stable_text_tokens = list(tail)
+
+    # Reset KV cache (forces full re-prefill next chunk)
+    # Preserve encoder cache and _window_buf — audio context is valuable
+    self.prev_embeds = None
+    self.prev_prompt_len = 0
+
+    self.stagnant_chunks = 0
 
   def feed(self, new_audio: np.ndarray, is_final: bool = False) -> dict:
     """Feed new audio samples. Returns {"text": ..., "stats": ...}."""
@@ -857,20 +940,26 @@ class StreamingSession:
     # --- Decode (continuation after prefix) ---
     t_dec = time.time()
     chunk_tokens = [token]
+    self.hit_max_new = False
     for step in range(self.max_new_tokens - 1):
       if token in EOS_TOKEN_IDS: break
       pos = prompt_len + step
       out = model.decoder(Tensor([[token]]), model.v_dec_pos.bind(pos))
       token = int(out.item())
       chunk_tokens.append(token)
+    else:
+      if token not in EOS_TOKEN_IDS: self.hit_max_new = True
     while chunk_tokens and chunk_tokens[-1] in EOS_TOKEN_IDS: chunk_tokens.pop()
     decode_ms = (time.time() - t_dec) * 1000
+
+    # --- Repeat suppression: filter runs > MAX_REPEAT_TOKEN_RUN ---
+    chunk_tokens, dropped_repeats = self._suppress_repeats(chunk_tokens)
 
     # --- Update raw_tokens: prefix (uncapped) + newly decoded continuation ---
     self.raw_tokens = self.raw_tokens[:n_prefix_full] + chunk_tokens
     self.chunk_idx += 1
 
-    # --- Commit logic (C-style): find candidate, LCP against stable, emit delta ---
+    # --- Commit logic: candidate, LCP, overlap dedup, stagnation detection ---
     text_start = 0
     for i, t in enumerate(self.raw_tokens):
       if t == TOKEN_ASR_TEXT: text_start = i + 1; break
@@ -887,21 +976,65 @@ class StreamingSession:
       candidate_len = 0
 
     candidate = text_tokens[:candidate_len]
+    did_recovery = False
+    did_periodic = False
 
-    # LCP: longest common prefix with previous stable tokens
-    lcp = 0
-    while lcp < len(self.stable_text_tokens) and lcp < candidate_len \
-          and self.stable_text_tokens[lcp] == candidate[lcp]:
-      lcp += 1
+    # --- Stagnation / degenerate detection ---
+    candidate_advance = candidate_len - len(self.stable_text_tokens)
+    if not self._is_final and self.hit_max_new and candidate_advance <= 1:
+      self.stagnant_chunks += 1
+    else:
+      self.stagnant_chunks = 0
 
-    # Emit delta: new tokens from lcp to candidate_len
-    n_emitted_before = len(self.emitted_text)
-    if lcp < candidate_len:
-      new_tokens = candidate[lcp:]
-      self.emitted_text += model.tok.decode(new_tokens)
-    emit_delta = self.emitted_text[n_emitted_before:]
+    need_recovery = False
+    # Degenerate tail repeats?
+    tail_reps, tail_period = self._tail_repeat_blocks(candidate, self.DEGEN_MAX_PERIOD)
+    if tail_period > 0 and tail_reps >= self.DEGEN_MIN_REPEATS:
+      need_recovery = True
+    # Stagnant too long?
+    if self.stagnant_chunks >= self.STALE_CHUNKS:
+      need_recovery = True
+    # Too many repeats dropped?
+    if dropped_repeats >= 8:
+      need_recovery = True
 
-    self.stable_text_tokens = list(candidate)
+    if need_recovery and not self._is_final:
+      self._reanchor()
+      did_recovery = True
+      stderr_log(f"  ! recovery reset (stagnant={self.stagnant_chunks} tail_reps={tail_reps}x{tail_period} dropped={dropped_repeats})\n")
+    else:
+      # --- LCP: longest common prefix with previous stable tokens ---
+      lcp = 0
+      while lcp < len(self.stable_text_tokens) and lcp < candidate_len \
+            and self.stable_text_tokens[lcp] == candidate[lcp]:
+        lcp += 1
+
+      # Update stable with new candidate
+      self.stable_text_tokens = list(candidate)
+
+      # --- Overlap dedup: skip tokens already emitted ---
+      emit_start = lcp
+      if emit_start < candidate_len and len(self.emitted_text_tokens) > 0:
+        max_overlap = min(candidate_len - emit_start, len(self.emitted_text_tokens))
+        max_overlap = min(max_overlap, self.OVERLAP_MAX_TOKENS)
+        for k in range(max_overlap, self.OVERLAP_MIN_TOKENS - 1, -1):
+          if self.emitted_text_tokens[-k:] == candidate[emit_start:emit_start + k]:
+            emit_start += k
+            break
+
+      # Emit new tokens one by one (token-level tracking)
+      n_emitted_before = len(self.emitted_text)
+      for i in range(emit_start, candidate_len):
+        tok = candidate[i]
+        self.emitted_text += model.tok.decode([tok])
+        self.emitted_text_tokens.append(tok)
+      emit_delta = self.emitted_text[n_emitted_before:]
+
+      # --- Periodic reset (every N chunks, prevents slow drift) ---
+      if (not self._is_final and self.chunk_idx > self.unfixed_chunks
+          and (self.chunk_idx % self.RESET_INTERVAL_CHUNKS == 0)):
+        self._reanchor()
+        did_periodic = True
 
     # --- Stats ---
     total_ms = enc_ms + prefill_ms + decode_ms
@@ -921,24 +1054,28 @@ class StreamingSession:
       "max_windows": self.max_enc_windows,
       "decode_tokens": len(chunk_tokens),
       "committed": len(self.stable_text_tokens),
-      "pending": n_text - candidate_len,
+      "pending": n_text - candidate_len if not did_recovery else 0,
       "prefix_fed": len(prefix_toks),
     }
 
     # --- Diagnostic log ---
-    # Decode what the model actually produced this chunk (raw continuation)
     decode_text = model.tok.decode(chunk_tokens).replace('\n', ' ')
-    # Pending tail (unfixed tokens not yet committed)
-    pending_text = model.tok.decode(text_tokens[candidate_len:]) if candidate_len < n_text else ""
+    pending_text = model.tok.decode(text_tokens[candidate_len:]) if candidate_len < n_text and not did_recovery else ""
+    flags = ""
+    if did_recovery: flags += " !RECOVERY"
+    if did_periodic: flags += " !PERIODIC_RESET"
+    if dropped_repeats: flags += f" dropped={dropped_repeats}"
     stderr_log(
       f"chunk {self.chunk_idx}: {audio_sec:.1f}s  "
       f"enc={enc_ms:.0f}ms prefill={prefill_ms:.0f}ms({reuse_point}kv) decode={decode_ms:.0f}ms({len(chunk_tokens)}tok)  "
-      f"win={len(self.enc_cache)}/{self.max_enc_windows} prefix={len(prefix_toks)} raw={len(self.raw_tokens)}\n"
+      f"win={len(self.enc_cache)}/{self.max_enc_windows} prefix={len(prefix_toks)} raw={len(self.raw_tokens)}{flags}\n"
       f"  decoded : {decode_text!r}\n"
-      f"  commit  : lcp={lcp}/{len(self.stable_text_tokens)} candidate={candidate_len} "
-      f"emit={candidate_len - lcp}tok emitted_total={len(self.stable_text_tokens)}\n"
-      f"  +emit   : {emit_delta!r}\n"
-      f"  pending : {pending_text!r}\n"
+      + (f"  commit  : lcp={lcp}/{candidate_len} "
+         f"emit={candidate_len - emit_start}tok emitted_total={len(self.emitted_text_tokens)}\n"
+         f"  +emit   : {emit_delta!r}\n"
+         f"  pending : {pending_text!r}\n"
+         if not did_recovery else
+         f"  commit  : reset (emitted_total={len(self.emitted_text_tokens)}, carry={self.RESET_CARRY_TOKENS})\n")
     )
 
 # ============================================================================
