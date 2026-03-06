@@ -6,6 +6,10 @@ dependencies = ["tinygrad", "websockets"]
 [project.optional-dependencies]
 dev = ["ruff"]
 
+[tool.mypy]
+ignore_missing_imports = true
+check_untyped_defs = false
+
 [tool.ruff]
 line-length = 140
 target-version = "py312"
