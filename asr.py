@@ -1299,19 +1299,26 @@ def start_ws_server(model: ASR, port: int, save_audio_dir: str | None = None, ru
       _save_session_audio(audio_chunks, save_audio_dir)
       stderr_log("ws: connection closed\n")
 
-  async def run():
+  async def run_forever():
     async with serve(ws_handler, "0.0.0.0", port) as server:
       await server.serve_forever()
 
+  async def run_until_sigint():
+    stop = asyncio.Event()
+    import signal
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    async with serve(ws_handler, "0.0.0.0", port):
+      await stop.wait()
+
   if run_in_background:
     loop = asyncio.new_event_loop()
-    t = threading.Thread(target=loop.run_until_complete, args=(run(),), daemon=True)
+    t = threading.Thread(target=loop.run_until_complete, args=(run_forever(),), daemon=True)
     t.start()
     class _Shutdown:
       def shutdown(self): loop.call_soon_threadsafe(loop.stop)
     return _Shutdown()
   else:
-    asyncio.run(run())
+    asyncio.run(run_until_sigint())
 
 # ============================================================================
 # Model registry and CLI
@@ -1360,8 +1367,8 @@ if __name__ == "__main__":
     stderr_log(f"open http://localhost:{args.serve} for microphone transcription\n")
     stderr_log(f"websocket on ws://localhost:{ws_port}\n")
     # WS in main thread — tinygrad's SQLite cache is thread-local
-    try: start_ws_server(model, ws_port, args.save_audio, run_in_background=False)
-    except KeyboardInterrupt: stderr_log("shutting down\n"); http_server.server_close()
+    start_ws_server(model, ws_port, args.save_audio, run_in_background=False)
+    stderr_log("shutting down\n"); http_server.server_close()
   elif args.audio:
     result = model.transcribe(args.audio)
     print(result["text"])
