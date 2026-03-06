@@ -259,21 +259,25 @@ class AudioEncoder:
     x = self.ln_post(x)
     return self.proj2(self.proj1(x).gelu())
 
-  def _transformer(self, x: Tensor, cu_seqlens: list[int]) -> Tensor:
-    """Non-JIT transformer path (multi-window fallback)."""
-    for block in self.blk: x = block(x, self.n_heads, self.head_dim, cu_seqlens)
-    x = self.ln_post(x)
-    return self.proj2(self.proj1(x).gelu()).realize()
+  def _encode_window(self, mel_tensor: Tensor) -> Tensor:
+    """Encode a single 800-frame window. JIT-friendly (fixed shape).
+    mel_tensor: [128, 800]. Returns [104, output_dim]."""
+    return self._encode_batched(mel_tensor)
 
   def forward(self, mel: np.ndarray) -> Tensor:
     """Encode mel spectrogram [128, frames] → [n_tokens, output_dim].
 
-    Pads mel to fixed bucket boundaries (multiples of bucket_frames) so the JIT
-    sees a small number of unique graph shapes and caches them effectively.
-    Uses JIT'd batched path for single-window buckets (≤800 frames).
+    Two paths:
+    - Batched JIT: for pre-warmed bucket sizes (800, 1600, etc.), processes
+      all windows in a single JIT call with batched attention. Fast.
+    - Sequential JIT: for any other size, splits into 800-frame windows and
+      encodes each through the single-window JIT. No compilation surprises,
+      scales to any audio length.
+
+    Both produce identical output (attention is windowed, no cross-window deps).
     """
     actual_frames = mel.shape[1]
-    bucket_frames = self.chunk_size * 8  # 800 frames per bucket
+    bucket_frames = self.chunk_size * 8  # 800 frames per window
     padded_frames = ((actual_frames + bucket_frames - 1) // bucket_frames) * bucket_frames
     if padded_frames > actual_frames:
       mel = np.pad(mel, ((0, 0), (0, padded_frames - actual_frames)), mode='constant')
@@ -286,15 +290,25 @@ class AudioEncoder:
     tail = actual_frames % self.chunk_size
     if tail > 0: actual_tokens += max(1, tail // 8)
 
-    # JIT'd batched path (separate JIT per bucket size, each compiles once)
     # (+0).realize() forces a fresh buffer copy — JIT reuses output buffers,
     # so callers caching encoder outputs (streaming) need independent copies
-    if hasattr(self, '_encode_jits'):
-      if padded_frames not in self._encode_jits:
-        self._encode_jits[padded_frames] = TinyJit(self._encode_batched)
+
+    # Path 1: Batched JIT for pre-warmed bucket sizes (fast, single JIT call)
+    if hasattr(self, '_encode_jits') and padded_frames in self._encode_jits:
       mel_tensor = Tensor(mel).contiguous()
       out = self._encode_jits[padded_frames](mel_tensor)
       return (out[:actual_tokens] + 0).realize()
+
+    # Path 2: Sequential single-window JIT (any length, no compilation surprise)
+    if hasattr(self, '_encode_window_jit'):
+      n_windows = padded_frames // bucket_frames
+      window_outputs = []
+      for i in range(n_windows):
+        window_mel = Tensor(mel[:, i * bucket_frames:(i + 1) * bucket_frames]).contiguous()
+        out = self._encode_window_jit(window_mel)
+        window_outputs.append((out + 0).realize())
+      full = Tensor.cat(*window_outputs, dim=0) if len(window_outputs) > 1 else window_outputs[0]
+      return full[:actual_tokens]
 
     # Non-JIT fallback
     mel_tensor = Tensor(mel).contiguous()
@@ -391,27 +405,51 @@ class ASR:
     model._prefix_embeds = decoder.token_embd(Tensor(PROMPT_PREFIX)).realize()
     model._suffix_embeds = decoder.token_embd(Tensor(PROMPT_SUFFIX)).realize()
 
-    # Dict of encoder JITs keyed by bucket size (each bucket compiles once)
-    encoder._encode_jits = {}
+    # Encoder JIT setup:
+    # - _encode_window_jit: single 800-frame window, universal fallback for any length
+    # - _encode_jits: batched multi-window for pre-warmed bucket sizes (faster)
+    encoder._encode_window_jit = TinyJit(encoder._encode_window)
+    encoder._encode_jits = {}  # populated during warmup
 
     return model
 
+  # Pre-warmed encoder bucket sizes: covers audio up to 32s in per-file mode.
+  # Longer audio uses the sequential single-window path (no compilation needed).
+  ENCODER_BUCKETS = [800, 1600, 2400, 3200]
+
   def warmup(self):
     """Exercise all JIT paths so subsequent calls are fast.
-    Needs 2-3 calls with different sizes to compile @function variants."""
+
+    JIT setup:
+    - Encoder single-window JIT (800 frames): always available, any audio length
+    - Encoder batched JITs (800-3200): pre-warmed for fast per-file mode (<=32s)
+    - Decoder prefill JIT: symbolic variables, 3 sizes for @function compilation
+    - Decoder single-token JIT: one call
+
+    JITBEAM kernel optimizations are cached to disk (~/.cache/tinygrad/cache.db).
+    First-ever run is slow (beam search). Subsequent runs hit cache.
+    """
     stderr_log("warming up JIT...\n")
     dim = self._embed_buf.shape[2]
-    # Encoder JIT warmup: exercise primary bucket sizes (800, 1600)
-    # 2-3 calls per bucket to compile @function variants
-    for bucket in [800, 1600]:
+    dummy = np.zeros((128, 800), dtype=np.float32)
+
+    # 1. Single-window encoder JIT (universal fallback, always needed)
+    for _ in range(3):
+      self.encoder._encode_window_jit(Tensor(dummy).contiguous()).realize()
+
+    # 2. Batched multi-window JITs for pre-warmed bucket sizes
+    for bucket in self.ENCODER_BUCKETS:
+      self.encoder._encode_jits[bucket] = TinyJit(self.encoder._encode_batched)
       for _ in range(3):
         self.encoder.forward(np.zeros((128, bucket), dtype=np.float32)).realize()
-    # Prefill warmup: 3 different sizes to exercise @function compilation
+
+    # 3. Prefill JIT: 3 different sizes to exercise @function compilation
     for nt in [200, 100, 150]:
       self._embed_buf[:, :nt].assign(Tensor.randn(1, nt, dim).contiguous()).realize()
       sp_b, nt_b = self.v_sp.bind(0), self.v_nt.bind(nt)
       self.decoder.prefill_embed_jit(self._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
-    # Decode warmup: single-token path
+
+    # 4. Decode JIT: single-token path
     self.decoder(Tensor([[0]]), self.v_dec_pos.bind(200))
     stderr_log("warmup done\n")
 

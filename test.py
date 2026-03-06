@@ -24,16 +24,16 @@ os.environ.setdefault('CUDA_PTX', '1')
 
 BASELINES = {
   # Per-file mode (JITBEAM=2, 30 utterances, LibriSpeech test-clean)
-  "perfile_wer": 1.5,       # % — must be at or below (current: 0.65%)
-  "perfile_rtf": 0.25,      # must be at or below (current: 0.123)
+  "perfile_wer": 1.0,       # % — must be at or below (current: 0.65%)
+  "perfile_rtf": 0.15,      # must be at or below (current: 0.070)
 
   # Streaming mode (JITBEAM=2, 30 utterances)
-  "stream_wer": 5.0,        # % — must be at or below (current: 2.10%)
-  "stream_rtf": 0.50,       # must be at or below (current: 0.263)
+  "stream_wer": 3.0,        # % — must be at or below (current: 2.10%)
+  "stream_rtf": 0.30,       # must be at or below (current: 0.203)
 
   # Single-file JFK (warm, JITBEAM=2)
-  "jfk_rtf": 0.15,          # must be at or below (current: ~0.05)
-  "jfk_stream_rtf": 0.40,   # must be at or below (current: ~0.20)
+  "jfk_rtf": 0.08,          # must be at or below (current: ~0.05)
+  "jfk_stream_rtf": 0.25,   # must be at or below (current: ~0.16)
 }
 
 JFK_EXPECTED = "And so, my fellow Americans, ask not what your country can do for you; ask what you can do for your country."
