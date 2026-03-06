@@ -204,6 +204,67 @@ Both produce identical output because attention is windowed — no cross-window 
 
 ---
 
+## Parameter sweep: chunk_sec × rollback
+
+**Problem:** Streaming WER (3.8% on real mic, 9.3% on 119s clean) has a gap vs per-file (0%). The two main knobs are `chunk_sec` (how much audio per decode) and `rollback` (how many tail tokens to withhold from commit). Need data to pick defaults.
+
+**Tool:** `sweep_params.py` — grid-searches `(chunk_sec, rollback)` on captured WAV files, using per-file transcription as reference. Reports WER table per file + ranked summary. Uses `StreamingSession.verbose = False` to suppress per-chunk logging.
+
+**Results (real mic 51.7s, 52 ref words):**
+
+| | rb=3 | rb=5 | rb=7 |
+|---|---|---|---|
+| **2s** | 5.8% | 3.8% | 3.8% |
+| **4s** | 7.7% | 3.8% | 3.8% |
+| **6s** | 3.8% | 3.8% | 3.8% |
+| **8s** | 7.7% | 3.8% | 3.8% |
+
+JFK (11s, clean): 0% WER across all 12 combos.
+
+**Key findings:**
+
+1. **Rollback matters more than chunk size.** rb≥5 achieves 3.8% regardless of chunk size. rb=3 is worse at every chunk size — commits too aggressively.
+
+2. **Chunk size barely affects WER** once rollback is sufficient. Even 8s chunks (near per-file context) produce the same 3.8% error.
+
+3. **The residual error is prefix feedback reinforcement, not chunk boundary.** The "Thim" misdecoding at chunk 13 persists at all chunk sizes because once decoded, it's fed back as prefix context in every subsequent chunk. The model sees "Thim" in its input and keeps reproducing it. Rollback only delays commitment — it can't correct errors already in the prefix. Per-file mode avoids this entirely (no prefix feedback, full audio context).
+
+4. **RTF sweet spot: 4-6s.** 2s chunks have highest per-chunk overhead (RTF 0.65). 6s is most efficient (RTF 0.33). But for live mic UX, 2s gives more responsive text updates.
+
+**Decision:** Keep defaults at **2s chunks, rollback=5**. The sweep confirmed these are near-optimal for WER, and the responsiveness advantage of 2s updates outweighs the RTF savings of larger chunks. UI presets are not needed — there's no meaningful quality tradeoff to expose to users.
+
+---
+
+## WebSocket: BaseHTTPRequestHandler incompatibility
+
+**Problem:** Hand-rolled WebSocket (RFC 6455) over Python's `BaseHTTPRequestHandler` worked with Python test clients but failed with browsers. Browser connection closed immediately with code 1006 (abnormal closure). Server's `rfile.read(2)` returned `b''` right after sending the 101 response.
+
+**Root cause:** Two issues discovered:
+1. `BaseHTTPRequestHandler.send_response()` uses `self.protocol_version` which defaults to `HTTP/1.0`. Browsers reject `HTTP/1.0 101 Switching Protocols` — the WebSocket spec requires HTTP/1.1.
+2. `BufferedReader` (rfile) returns empty bytes after HTTP header parsing on Windows, even though the socket is still open. This occurs with both `self.request.sendall()` and `self.wfile.write()` approaches.
+
+**Tried:** Setting `self.protocol_version = "HTTP/1.1"`, using `self.wfile` instead of raw socket, creating fresh `sock.makefile("rb")` wrappers. Python test clients passed with all approaches; browsers failed with all.
+
+**Solution:** Replaced hand-rolled WebSocket with the `websockets` library (`pip install websockets`). Runs on a separate port (HTTP port + 1) in its own asyncio event loop. ~80 lines of RFC 6455 code removed. Browser connections work immediately.
+
+**Threading constraint:** The websockets server must run in the main thread because tinygrad's SQLite disk cache is thread-local (created during `model.warmup()` in the main thread). HTTP server runs in a daemon thread instead.
+
+**Ctrl+C on Windows:** `asyncio.run(serve_forever())` ignores `KeyboardInterrupt` on Windows. Fixed with `signal.SIGINT` handler that sets an `asyncio.Event`, cleanly stopping the server.
+
+---
+
+## Silence auto-commit: pipeline-level, not display-level
+
+**Problem:** When the user stops speaking, the last few words stay as pending (dim italic) indefinitely. The rollback tail is never committed because no new text arrives to push it past the LCP.
+
+**First attempt (broken):** In `feed()`'s display section, track how many chunks `committed` text is unchanged while `pending` exists. After 3 chunks, directly append `pending_text` to `emitted_text` and update `stable_text_tokens`. This caused **double-emission**: `_process_chunk`'s commit pipeline didn't know about the direct modification, so it later re-committed the same tokens through the normal LCP/emit path.
+
+**Solution:** Move silence detection into `_process_chunk`'s commit logic. Track `prev_pending_tokens` and `pending_stable_chunks`. If the rollback tail tokens are identical for 3 consecutive chunks, set `candidate_len = n_text` (commit everything, including the tail). This works within the existing LCP/emit pipeline — tokens can only be emitted once.
+
+**Also fixed:** `feed([], is_final=True)` with no remaining audio (stop button) now commits all pending tokens immediately, regardless of the silence counter.
+
+---
+
 ## Diagnostic logging for streaming sessions
 
 **Problem:** Browser streaming sessions showed quality issues (dropped words, garbled text) but the server log only showed timing stats — no visibility into what the model decoded or what was committed.

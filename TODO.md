@@ -12,16 +12,14 @@
 - ~~**WebSocket streaming.**~~ Replaces HTTP polling. Binary Int16 PCM frames, JSON responses. Lower overhead per chunk.
 - ~~**Confidence display.**~~ Committed text (bright) vs pending rollback tail (dim italic) in web UI.
 
-## Streaming Quality — Parameter Sweep
+## Streaming Quality
 
-Current streaming WER gap vs per-file (per-file is 0%):
-- Clean 11s: 0% | Clean 119s: 9.3% | Real mic 47s: 23.3%
-
-The two main knobs are `chunk_sec` (latency vs throughput) and `rollback` (safety vs waste). Need data to pick defaults.
-
-- **`--save-audio` flag.** Server saves each session's raw PCM to a timestamped WAV file. Captures real mic audio for offline replay — zero cost when off.
-- **`sweep_params.py` tool.** Takes a captured WAV + reference transcript, runs it through `StreamingSession` with a grid of `(chunk_sec, rollback)` values, reports WER and committed word count for each combo. Determines the best operating points for live vs batch use cases.
-- **UI presets.** Dropdown or toggle in the web UI: e.g. "Live" (2s/rollback=5), "Balanced" (4s/rollback=4), "Accurate" (8s/rollback=3). Sent in the WebSocket `start` message, server creates session with those params. Defaults chosen from sweep results.
+- ~~**`--save-audio` flag.**~~ Server saves each session's raw PCM to timestamped WAV. `--save-audio DIR`.
+- ~~**`sweep_params.py` tool.**~~ Grid-search `(chunk_sec, rollback)` on captured WAVs vs per-file reference. Used to validate defaults.
+- ~~**Parameter sweep completed.**~~ Tested chunk_sec={2,4,6,8} × rollback={3,5,7} on real mic 51.7s + JFK 11s. Findings: rollback≥5 achieves 3.8% WER regardless of chunk size. Residual error is prefix feedback reinforcement (not chunk boundary). Current defaults (2s/rb=5) confirmed near-optimal. See ENGINEERING_LOG.md for full results.
+- ~~**Silence auto-commit.**~~ Pending tokens stable for 3 chunks → auto-committed via pipeline (not display hack).
+- ~~**Final commit on stop.**~~ `feed([], is_final=True)` commits all pending tokens immediately.
+- **~~UI presets.~~** Not needed — sweep showed no meaningful quality tradeoff between chunk sizes once rollback≥5. Responsiveness (2s) wins over RTF savings (4-6s).
 - **Long-form audio testing.** Need 10-30 minute test clips (podcast, lecture) to stress periodic reset and long-term drift. Current max is 119s.
 
 ## Performance
