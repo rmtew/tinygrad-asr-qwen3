@@ -152,3 +152,72 @@ Both produce identical output because attention is windowed — no cross-window 
 | RTF | 0.22 | **0.16** |
 | Prefill total | ~1200ms | ~800ms |
 | KV tokens reused | 0 | 245 |
+
+---
+
+## C-style streaming: text prefix feedback + monotonic commit
+
+**Problem:** The original streaming approach re-transcribed the entire audio window each chunk. When encoder windows were evicted (>32s), old text disappeared. The transcript flickered — each chunk replaced the full display. For long audio (>60s), the output was essentially useless.
+
+**Reference:** The C implementation (`qwen_asr.c stream_impl`) solves this with three mechanisms: text prefix feedback, rollback-based commit, and recovery resets.
+
+**Solution:** Rewrote `StreamingSession` to match the C architecture:
+
+1. **Text prefix feedback.** After initial unfixed chunks, embed previous decoded tokens (minus rollback=5) and append to the prompt after audio+suffix. The decoder sees what was said before, even after the audio is gone. `raw_tokens` tracks the full decoded history (prefix + continuation); only `max_prefix_tokens=150` are embedded in the prompt.
+
+2. **Monotonic commit.** Extract text tokens from `raw_tokens`, compute candidate (minus rollback tail). LCP against previous `stable_text_tokens` finds the stable frontier. Only emit delta tokens beyond the LCP. `emitted_text` grows monotonically — old text never removed.
+
+3. **Overlap dedup.** Before emitting from the LCP point, check if new tokens overlap with the tail of `emitted_text_tokens` (window: min=4, max=48 tokens). Prevents duplicate text when the model re-generates tokens already committed.
+
+4. **Repeat suppression.** Filter `chunk_tokens` runs exceeding `MAX_REPEAT_TOKEN_RUN=12`, continuing the run count from the end of the prefix. Prevents degenerate repetition loops.
+
+5. **Stagnation detection + recovery reset.** Three triggers:
+   - Stagnant: `candidate_advance ≤ 1` AND hit `max_new_tokens` for 4+ consecutive chunks
+   - Degenerate: tail repeat blocks (period ≤ 6, repeats ≥ 4)
+   - Dropped repeats ≥ 8
+   
+   Recovery (`_reanchor`): rebuild `raw_tokens` from last 24 `emitted_text_tokens`, reset KV cache. **Critical difference from C:** preserve encoder cache and `_window_buf`. The C code clears the encoder cache because it retains the full audio buffer and re-encodes. Our session receives audio incrementally via `feed()` — clearing enc_cache loses all audio context.
+
+6. **Periodic reset.** Every 45 chunks (~90s), force `_reanchor` to prevent slow drift accumulation.
+
+**Bug: destructive reanchor.** Initial implementation cleared `enc_cache` and `_window_buf` on reset, matching the C code literally. This was catastrophic — after the periodic reset at chunk 45, the model had zero encoder windows and could barely produce text for the remaining 30 seconds. NOTLD 119s WER: 8.4% → 21.9%. Fix: preserve encoder cache in `_reanchor`. WER: 21.9% → 9.3%.
+
+---
+
+## Streaming quality baselines
+
+**Test infrastructure:** `test_stream_quality.py` compares streaming vs per-file WER. `test_session.py` runs `StreamingSession.feed()` with per-chunk diagnostic output.
+
+**Results (0.6B model, RTX 3070 Laptop):**
+
+| Test | Stream WER | Per-file WER | Gap |
+|------|-----------|-------------|-----|
+| JFK 11s clean | 0.0% | 0.0% | 0% |
+| NOTLD 119s clean | 9.3% | 0.0% | 9.3% |
+| Real mic 47s | 23.3% | 0.0% | 23.3% |
+
+**Root cause of baseline gap (~9% on clean audio):** Each 2s chunk generates ~5-13 continuation tokens. With rollback=5, only ~0-8 net new tokens are committed per chunk. Normal speech at 150 WPM produces ~7 tokens per 2s. The model's continuation sometimes under-generates, losing words. This compounds over 60 chunks.
+
+**Noise amplifies the gap.** Noisy audio (phone speaker → mic, fan noise) causes the model to generate fewer/worse continuation tokens, widening the gap to ~23%+.
+
+**Mitigations applied:** Browser-side `getUserMedia` constraints (`noiseSuppression`, `echoCancellation`, `autoGainControl`) for free noise reduction via Chrome's WebRTC pipeline.
+
+---
+
+## Diagnostic logging for streaming sessions
+
+**Problem:** Browser streaming sessions showed quality issues (dropped words, garbled text) but the server log only showed timing stats — no visibility into what the model decoded or what was committed.
+
+**Solution:** Rich per-chunk diagnostic log to stderr:
+
+```
+chunk 15: 30.0s  enc=14ms prefill=731ms(309kv) decode=125ms(12tok)  win=3/4 prefix=58 raw=70
+  decoded : ' all? I mean, is Willer the nearest town?'
+  commit  : lcp=55/62 emit=7tok emitted_total=62
+  +emit   : ' all? I mean, is Will'
+  pending : 'er the nearest town?'
+```
+
+Each line shows: what the model generated (`decoded`), how it compared to previous stable (`lcp`), what new text was committed (`+emit`), and the unfixed rollback tail (`pending`). Recovery events are flagged with `!RECOVERY` or `!PERIODIC_RESET`.
+
+Stagnation is immediately visible as consecutive `emit=0tok` chunks. LCP breakage (model contradicting prefix) shows as `lcp < stable`. Enables direct correlation between browser user experience and server-side model behavior.
