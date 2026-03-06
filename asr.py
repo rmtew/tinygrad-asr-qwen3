@@ -822,7 +822,7 @@ class StreamingSession:
     parts = [model._prefix_embeds, audio_embeds, model._suffix_embeds]
     if prefix_toks:
       tok_ids = Tensor([prefix_toks])
-      tok_embeds = model.decoder.tok_embeddings(tok_ids).squeeze(0).realize()
+      tok_embeds = model.decoder.token_embd(tok_ids).squeeze(0).realize()
       parts.append(tok_embeds)
     combined = Tensor.cat(*parts, dim=0).reshape(1, -1, dim)
     prompt_len = combined.shape[1]
@@ -1105,7 +1105,10 @@ if __name__ == "__main__":
     model.warmup()
     ASRHandler.model = model
     stderr_log(f"open http://localhost:{args.serve} for microphone transcription\n")
-    TCPServerWithReuse(('', args.serve), ASRHandler).serve_forever()
+    server = TCPServerWithReuse(('', args.serve), ASRHandler)
+    server.daemon_threads = True
+    try: server.serve_forever()
+    except KeyboardInterrupt: stderr_log("shutting down\n"); server.server_close()
   elif args.audio:
     result = model.transcribe(args.audio)
     print(result["text"])
