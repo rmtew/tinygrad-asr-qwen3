@@ -1,29 +1,45 @@
 # TODO
 
+## Done
+
+- ~~**Decoder KV cache reuse across streaming chunks.**~~ 245 tokens reused for JFK 11s, streaming RTF 0.22 → 0.16.
+- ~~**Server with web UI.**~~ OpenAI-compatible server, embedded HTML mic UI, file upload, auto-routing.
+- ~~**Microphone/live transcription.**~~ Record button, live updates every 2s, drag-and-drop.
+- ~~**C-style streaming architecture.**~~ Text prefix feedback, monotonic commit, overlap dedup, repeat suppression, stagnation recovery, periodic reset. Matches `qwen_asr.c stream_impl` design.
+- ~~**Diagnostic logging.**~~ Per-chunk server log: decoded text, LCP/commit flow, emit delta, pending tail, recovery events. Correlates browser sessions to quality issues.
+- ~~**Quality test infrastructure.**~~ `test_stream_quality.py`: streaming vs per-file WER on clean, noisy, real mic audio. `test_session.py`: diagnostic harness for StreamingSession.feed().
+- ~~**Browser noise suppression.**~~ `getUserMedia` with `noiseSuppression`, `echoCancellation`, `autoGainControl`.
+
+## Streaming Quality
+
+Current streaming WER gap vs per-file (per-file is 0%):
+- Clean 11s: 0% | Clean 119s: 9.3% | Real mic 47s: 23.3%
+
+- **Investigate remaining 9% clean baseline gap.** Each 2s chunk generates ~5-13 tokens continuation with rollback=5, so only ~0-8 net new tokens committed per chunk. Fundamental to the architecture — model under-generates relative to speech rate. Options:
+  - Test larger `chunk_sec` (4s, 8s) — more tokens per chunk, fewer rollback losses, higher latency.
+  - Test `rollback=3` without recovery mechanisms (simpler, may work for clean audio).
+  - Server-side noise reduction (`noisereduce` spectral gating or high-pass filter) for mic audio.
+- **Long-form audio testing.** Need 10-30 minute test clips (podcast, lecture) to stress the periodic reset and long-term drift behavior. Current max is 119s.
+
 ## Performance
 
-- ~~**Decoder KV cache reuse across streaming chunks.**~~ Done — 245 tokens reused for JFK 11s, streaming RTF 0.22 → 0.16.
-- **Larger streaming chunks.** Test 4s or 8s `chunk_sec` to reduce encoder/prefill/decode cycles per file. Tradeoff: higher latency for first text output.
-- **Encoder partial-tail caching.** The partial tail (audio beyond the last complete 8s window) is re-encoded from scratch every chunk. Could cache and extend instead.
-- **Pre-warm more encoder buckets.** New bucket sizes (e.g. 2400 frames for ~20s audio) trigger JIT compilation on first encounter (~3-4s hit). Could pre-warm common sizes during startup.
+- **Larger streaming chunks.** Test 4s or 8s `chunk_sec` to reduce encoder/prefill/decode cycles. Tradeoff: higher latency for first text output.
+- **Encoder partial-tail caching.** The partial tail (audio beyond the last complete 8s window) is re-encoded from scratch every chunk. Could cache and extend.
+- **Pre-warm more encoder buckets.** New bucket sizes trigger JIT compilation on first encounter (~3-4s). Could pre-warm common sizes during startup.
 
 ## Testing
 
-- **Regression tests.** Both single-file and streaming modes need tests that prevent quality regressions:
-  - Quick smoke tests: JFK transcription exact match, a few short LibriSpeech files.
-  - Longer benchmark: 30+ file LibriSpeech WER + RTF check against known baselines.
-  - Streaming correctness: verify that each chunk produces the full transcription seen so far (not just the tail).
-  - Performance gate: fail if RTF regresses beyond a threshold.
+- **Regression tests.** `test.py` covers: JFK exact match (per-file + streaming), 5-file LibriSpeech WER, RTF gates. Could add:
+  - Streaming session WER gate (currently only in `test_stream_quality.py`, not in CI).
+  - Recovery mechanism coverage: verify stagnation detection triggers, periodic reset works.
+- **Long-form audio benchmarks.** Current test data maxes at 119s. Need varied speakers, background noise, topic changes.
 
 ## Code Cleanup
 
-- ~~**Server refactor.**~~ Done — clean server with embedded HTML microphone UI, auto-routing long audio to streaming, proper format handling.
-- **Separate encoder/decoder modules.** `asr.py` is ~800 lines. The `AudioEncoder`, `ASR` model, server handler, and CLI could be split into separate files.
-
-## Testing
-
-- **Long-form audio benchmarks.** Download a podcast or lecture clip (10-30 min) to test long-audio paths. Current test data maxes out at 119s (Night of the Living Dead). Need to verify streaming quality/RTF on real long-form content with varied speakers, background noise, topic changes.
+- **Separate modules.** `asr.py` is ~1100 lines. AudioEncoder, ASR model, StreamingSession, server handler, and CLI could be split.
 
 ## Features
 
-- ~~**Microphone/live transcription mode.**~~ Done — web UI at `GET /` with Record button, live updates every 2s, file drag-and-drop. Future: true WebSocket streaming for lower latency, LLM response integration.
+- **Server-side noise reduction.** `noisereduce` (spectral gating) or simple high-pass filter (~200-300Hz) to remove fan/ambient noise before ASR. Browser noiseSuppression helps but server-side would catch upload-file path too.
+- **WebSocket streaming.** Replace HTTP polling with WebSocket for lower latency mic transcription.
+- **Confidence/partial display.** Show committed text in normal weight, pending (unfixed rollback tail) in lighter color so user can see what's stable vs. provisional.
