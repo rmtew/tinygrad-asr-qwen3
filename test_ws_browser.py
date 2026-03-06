@@ -1,6 +1,10 @@
-"""Start mock server for browser WebSocket testing.
-Open http://localhost:18091 in browser, click Record, check console."""
-import sys, os, time, threading
+"""Mock server for browser WebSocket testing. No model loading.
+
+Run:  py test_ws_browser.py
+Open: http://localhost:18091
+Ctrl+C to stop.
+"""
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 class MockSession:
@@ -11,8 +15,7 @@ class MockSession:
     self.chunks += 1
     self.total_samples += len(audio)
     secs = self.total_samples / 16000
-    from tinygrad.helpers import stderr_log
-    stderr_log(f"  MockSession.feed: chunk={self.chunks} samples={len(audio)} total={secs:.1f}s final={is_final}\n")
+    print(f"  feed: chunk={self.chunks} samples={len(audio)} total={secs:.1f}s", flush=True)
     return {
       "text": f"chunk {self.chunks}: {secs:.1f}s of audio",
       "committed": f"chunk {self.chunks}: {secs:.1f}s",
@@ -25,27 +28,23 @@ class MockSession:
 
 import asr
 asr.StreamingSession = lambda model, **kw: MockSession()
-from asr import ASRHandler, _HTML_DIR
+from asr import ASRHandler, start_ws_server
 from tinygrad.viz.serve import TCPServerWithReuse
 
-# Serve test_ws_page.html as the root page instead of index.html
-_orig_do_GET = ASRHandler.do_GET
-def _patched_do_GET(self):
-  if self.path == '/':
-    import os
-    html_path = os.path.join(_HTML_DIR, 'test_ws_page.html')
-    self.send_data(open(html_path, 'rb').read(), content_type="text/html")
-  else:
-    _orig_do_GET(self)
-ASRHandler.do_GET = _patched_do_GET
-
 ASRHandler.model = "mock"
-PORT = 18091
-print(f"Mock server on http://localhost:{PORT} — open in browser, click Record")
-server = TCPServerWithReuse(("", PORT), ASRHandler)
+HTTP_PORT = 18091
+WS_PORT = HTTP_PORT + 1
+
+ws_server = start_ws_server("mock", WS_PORT)
+print(f"HTTP:      http://localhost:{HTTP_PORT}", flush=True)
+print(f"WebSocket: ws://localhost:{WS_PORT}", flush=True)
+print(f"Ctrl+C to stop\n", flush=True)
+
+server = TCPServerWithReuse(("", HTTP_PORT), ASRHandler)
 server.daemon_threads = True
 try:
   server.serve_forever()
 except KeyboardInterrupt:
-  print("shutdown")
+  print("\nshutdown")
   server.server_close()
+  ws_server.shutdown()

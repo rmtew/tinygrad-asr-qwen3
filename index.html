@@ -136,9 +136,9 @@ async function toggleMic() {
     source.connect(processor);
     processor.connect(audioCtx.destination);
 
-    // Open WebSocket
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${location.host}/ws`);
+    // Open WebSocket (runs on HTTP port + 1)
+    const wsPort = parseInt(location.port || '8090') + 1;
+    ws = new WebSocket(`ws://${location.hostname}:${wsPort}`);
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
       ws.send(JSON.stringify({type: 'start'}));
