@@ -1194,7 +1194,7 @@ class ASRHandler(HTTPRequestHandler):
             if session:
               result = session.feed(np.array([], dtype=np.float32), is_final=True)
               _ws_send(sock, 0x1, json.dumps({
-                "committed": result["committed"], "pending": "",
+                "committed": result["text"], "pending": "",
                 "stats": result.get("stats", {}), "status": "done",
               }).encode())
             ASRHandler.session = None; session = None
@@ -1208,7 +1208,7 @@ class ASRHandler(HTTPRequestHandler):
               "committed": result["committed"], "pending": result["pending"],
               "stats": result.get("stats", {}),
             }).encode())
-    except (ConnectionError, OSError, BrokenPipeError):
+    except (OSError, ValueError):
       pass
     finally:
       if session: ASRHandler.session = None
@@ -1292,6 +1292,8 @@ class ASRHandler(HTTPRequestHandler):
       if is_final:
         ASRHandler.session = None
         resp["status"] = "done"
+        resp["committed"] = result["text"]
+        resp["pending"] = ""
         stderr_log("stream session ended\n")
 
       self.send_data(json.dumps(resp).encode())
