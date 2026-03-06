@@ -714,7 +714,7 @@ ASR_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad ASR</title><style>
 const T = document.getElementById('transcript'), S = document.getElementById('status');
 let audioCtx, source, processor, pcmChunks, recording = false, sendTimer, sending = false, queued = false;
 
-// Build a WAV blob from float32 PCM samples — no codec issues, always works
+// Build a WAV blob from float32 PCM samples - no codec issues, always works
 function buildWav(samples, sr) {
   const n = samples.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
   const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
@@ -744,7 +744,7 @@ async function toggleMic() {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     audioCtx = new AudioContext({ sampleRate: 16000 });
     source = audioCtx.createMediaStreamSource(stream);
-    // ScriptProcessorNode captures raw PCM — no codec, no container format issues
+    // ScriptProcessorNode captures raw PCM - no codec, no container format issues
     processor = audioCtx.createScriptProcessor(4096, 1, 1);
     pcmChunks = [];
     processor.onaudioprocess = e => pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
