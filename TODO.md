@@ -17,8 +17,8 @@
 
 ## Code Cleanup
 
-- **Server refactor.** `asr.py` server code currently uses a basic HTTP handler adapted from tinygrad's viz server. Consider subclassing or reusing `llm.py`'s OpenAI-compatible server infrastructure instead — it already handles `/v1/` routing, JSON responses, and streaming.
-- **Separate encoder/decoder modules.** `asr.py` is ~700 lines. The `AudioEncoder`, `ASR` model, server handler, and CLI could be split into separate files.
+- ~~**Server refactor.**~~ Done — clean server with embedded HTML microphone UI, auto-routing long audio to streaming, proper format handling.
+- **Separate encoder/decoder modules.** `asr.py` is ~800 lines. The `AudioEncoder`, `ASR` model, server handler, and CLI could be split into separate files.
 
 ## Testing
 
@@ -26,4 +26,4 @@
 
 ## Features
 
-- **Microphone/live transcription mode.** `llm.py` runs an OpenAI chat server designed for LLM conversation. If we can optionally use the microphone, users could see their speech transcribed in real time — valuable for evaluating how the model responds in actual usage. The LLM response side may or may not be running; if no LLM is connected, just show transcriptions without errors. This would make it easy for users to test ASR quality interactively by speaking and watching the output.
+- ~~**Microphone/live transcription mode.**~~ Done — web UI at `GET /` with Record button, live updates every 2s, file drag-and-drop. Future: true WebSocket streaming for lower latency, LLM response integration.
