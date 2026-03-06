@@ -1077,7 +1077,8 @@ class StreamingSession:
     # --- Stats ---
     total_ms = enc_ms + prefill_ms + decode_ms
     audio_sec = self.total_samples / SAMPLE_RATE
-    rtf = (total_ms / 1000) / audio_sec if audio_sec > 0 else 0
+    chunk_audio_sec = self.chunk_samples / SAMPLE_RATE
+    rtf = (total_ms / 1000) / chunk_audio_sec if chunk_audio_sec > 0 else 0
     self.last_stats = {
       "audio_sec": round(audio_sec, 1),
       "chunk": self.chunk_idx,
