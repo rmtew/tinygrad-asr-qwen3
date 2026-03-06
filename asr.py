@@ -201,6 +201,9 @@ class AudioEncoder:
 
     # Transformer layers
     self.blk = [AudioEncoderBlock(d_model, ffn_dim) for _ in range(n_layers)]
+    # Set in ASR.from_gguf() after construction
+    self._encode_window_jit: TinyJit
+    self._encode_jits: dict
 
     # Post-norm + projection to decoder dimension
     self.ln_post = nn.LayerNorm(d_model)
@@ -343,6 +346,10 @@ class ASR:
     self.v_sp = UOp.variable("asr_sp", 0, decoder.max_context - 1)
     self.v_nt = UOp.variable("asr_nt", 1, decoder.max_context)
     self.v_dec_pos = UOp.variable("asr_dec_pos", 1, decoder.max_context - 1)
+    # Set in from_gguf() after construction
+    self._embed_buf: Tensor
+    self._prefix_embeds: Tensor
+    self._suffix_embeds: Tensor
 
   @staticmethod
   def from_gguf(gguf_tensor: Tensor) -> 'ASR':
@@ -1020,14 +1027,14 @@ class ASRHandler(HTTPRequestHandler):
   def _extract_audio(self, body: bytes, content_type: str) -> tuple[bytes | None, str]:
     """Extract audio bytes and filename from multipart/form-data or raw body."""
     if 'multipart/form-data' not in content_type:
-      return (body, ''), ''
+      return body, ''
 
     # Find boundary
     boundary = None
-    for part in content_type.split(';'):
-      part = part.strip()
-      if part.startswith('boundary='):
-        boundary = part[9:].strip('"').encode()
+    for ct_part in content_type.split(';'):
+      ct_part = ct_part.strip()
+      if ct_part.startswith('boundary='):
+        boundary = ct_part[9:].strip('"').encode()
     if boundary is None: return None, ''
 
     # Find file part
