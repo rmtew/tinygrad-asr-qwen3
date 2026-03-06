@@ -667,6 +667,15 @@ class StreamingSession:
 
     self.stagnant_chunks = 0
 
+  def _encode_audio(self, audio_samples: np.ndarray) -> Tensor:
+    """Compute mel spectrogram, pad to encoder bucket size, encode."""
+    mel = compute_mel(audio_samples)
+    bucket = self.model.encoder.chunk_size * 8
+    padded = ((mel.shape[1] + bucket - 1) // bucket) * bucket
+    if padded > mel.shape[1]:
+      mel = np.pad(mel, ((0, 0), (0, padded - mel.shape[1])))
+    return self.model.encoder.forward(mel[:, :padded])
+
   def feed(self, new_audio: np.ndarray, is_final: bool = False) -> dict:
     """Feed new audio samples. Returns {"text": ..., "stats": ...}."""
     self._is_final = is_final
@@ -735,12 +744,7 @@ class StreamingSession:
     while len(self._window_buf) >= self.enc_window_samples:
       window_audio = self._window_buf[:self.enc_window_samples]
       self._window_buf = self._window_buf[self.enc_window_samples:]
-      mel = compute_mel(window_audio)
-      bucket = model.encoder.chunk_size * 8
-      padded = ((mel.shape[1] + bucket - 1) // bucket) * bucket
-      if padded > mel.shape[1]:
-        mel = np.pad(mel, ((0, 0), (0, padded - mel.shape[1])))
-      enc_out = model.encoder.forward(mel[:, :padded])
+      enc_out = self._encode_audio(window_audio)
       actual_tokens = self.enc_window_frames // 8
       self.enc_cache.append((enc_out[:actual_tokens] + 0).realize())
 
@@ -749,12 +753,7 @@ class StreamingSession:
 
     partial_enc = None
     if len(self._window_buf) > 0:
-      mel = compute_mel(self._window_buf)
-      bucket = model.encoder.chunk_size * 8
-      padded = ((mel.shape[1] + bucket - 1) // bucket) * bucket
-      if padded > mel.shape[1]:
-        mel = np.pad(mel, ((0, 0), (0, padded - mel.shape[1])))
-      partial_out = model.encoder.forward(mel[:, :padded])
+      partial_out = self._encode_audio(self._window_buf)
       actual_partial = max(1, len(self._window_buf) // HOP_LENGTH // 8)
       partial_enc = (partial_out[:actual_partial] + 0).realize()
 
