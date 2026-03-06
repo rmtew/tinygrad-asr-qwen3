@@ -712,40 +712,73 @@ ASR_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad ASR</title><style>
 <div id="drop">Drop audio file here</div>
 <script>
 const T = document.getElementById('transcript'), S = document.getElementById('status');
-let mediaRec, chunks = [], recording = false, sendTimer;
+let audioCtx, source, processor, pcmChunks, recording = false, sendTimer, sending = false;
+
+// Build a WAV blob from float32 PCM samples — no codec issues, always works
+function buildWav(samples, sr) {
+  const n = samples.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0,'RIFF'); v.setUint32(4, 36+n*2, true); w(8,'WAVE'); w(12,'fmt ');
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,sr,true); v.setUint32(28,sr*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
+  w(36,'data'); v.setUint32(40, n*2, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(44 + i*2, s < 0 ? s*0x8000 : s*0x7FFF, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+function getPCM() {
+  let len = 0;
+  for (const c of pcmChunks) len += c.length;
+  const out = new Float32Array(len);
+  let off = 0;
+  for (const c of pcmChunks) { out.set(c, off); off += c.length; }
+  return out;
+}
 
 async function toggleMic() {
   if (recording) { stopMic(); return; }
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
-    mediaRec = new MediaRecorder(stream);
-    chunks = [];
-    mediaRec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-    mediaRec.start(500);
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new AudioContext({ sampleRate: 16000 });
+    source = audioCtx.createMediaStreamSource(stream);
+    // ScriptProcessorNode captures raw PCM — no codec, no container format issues
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    pcmChunks = [];
+    processor.onaudioprocess = e => pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
     recording = true;
     document.getElementById('mic').textContent = 'Stop';
     document.getElementById('mic').className = 'on';
     S.textContent = 'Listening...';
-    // Send accumulated audio every 2s for live transcription
-    sendTimer = setInterval(() => sendChunks(false), 2000);
+    sendTimer = setInterval(() => sendPCM(false), 2000);
   } catch(e) { S.textContent = 'Mic error: ' + e.message; }
 }
 
 function stopMic() {
   clearInterval(sendTimer);
-  mediaRec.stop();
-  mediaRec.stream.getTracks().forEach(t => t.stop());
+  processor.disconnect(); source.disconnect();
+  source.mediaStream.getTracks().forEach(t => t.stop());
+  audioCtx.close();
   recording = false;
   document.getElementById('mic').textContent = 'Record';
   document.getElementById('mic').className = '';
-  // Final transcription with all audio
-  setTimeout(() => sendChunks(true), 600);
+  sendPCM(true);
 }
 
-async function sendChunks(isFinal) {
-  if (chunks.length === 0) return;
-  const blob = new Blob(chunks, { type: mediaRec.mimeType || 'audio/webm' });
-  await transcribe(blob, isFinal ? 'recording.webm' : null);
+async function sendPCM(isFinal) {
+  if (pcmChunks.length === 0 || sending) return;
+  sending = true;
+  const samples = getPCM();
+  const sr = audioCtx ? audioCtx.sampleRate : 16000;
+  const dur = (samples.length / sr).toFixed(1);
+  S.textContent = isFinal ? 'Transcribing...' : dur + 's...';
+  const wav = buildWav(samples, sr);
+  await transcribe(wav, 'recording.wav');
+  sending = false;
 }
 
 async function uploadFile(file) {
@@ -756,13 +789,13 @@ async function uploadFile(file) {
 
 async function transcribe(blob, filename) {
   const fd = new FormData();
-  fd.append('file', blob, filename || 'audio.webm');
-  S.textContent = 'Transcribing...';
+  fd.append('file', blob, filename || 'audio.wav');
+  if (!S.textContent) S.textContent = 'Transcribing...';
   try {
     const r = await fetch('/v1/audio/transcriptions', { method: 'POST', body: fd });
     const d = await r.json();
     T.textContent = d.text;
-    S.textContent = '';
+    if (!recording) S.textContent = '';
   } catch(e) { S.textContent = 'Error: ' + e.message; }
 }
 
@@ -807,6 +840,10 @@ class ASRHandler(HTTPRequestHandler):
     try:
       audio = load_audio(tmp_path)
       audio_sec = len(audio) / SAMPLE_RATE
+      rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) > 0 else 0
+      stderr_log(f"recv: {len(audio_data)} bytes {suffix}, {audio_sec:.1f}s {len(audio)} samples, RMS={rms:.4f}\n")
+      if rms < 0.001:
+        stderr_log(f"WARNING: audio RMS near zero — likely silence or corrupt file\n")
       # Use streaming for long audio (>32s), per-file for short
       if audio_sec > 32:
         result = self.model.transcribe_stream(audio)
