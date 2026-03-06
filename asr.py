@@ -689,6 +689,7 @@ class ASR:
 # ============================================================================
 
 class StreamingSession:
+  verbose = True  # per-chunk diagnostic logging
   """Server-side streaming session matching the C implementation's architecture.
 
   Key design (from qwen_asr.c stream_impl):
@@ -1104,18 +1105,19 @@ class StreamingSession:
     if did_recovery: flags += " !RECOVERY"
     if did_periodic: flags += " !PERIODIC_RESET"
     if dropped_repeats: flags += f" dropped={dropped_repeats}"
-    stderr_log(
-      f"chunk {self.chunk_idx}: {audio_sec:.1f}s  "
-      f"enc={enc_ms:.0f}ms prefill={prefill_ms:.0f}ms({reuse_point}kv) decode={decode_ms:.0f}ms({len(chunk_tokens)}tok)  "
-      f"win={len(self.enc_cache)}/{self.max_enc_windows} prefix={len(prefix_toks)} raw={len(self.raw_tokens)}{flags}\n"
-      f"  decoded : {decode_text!r}\n"
-      + (f"  commit  : lcp={lcp}/{candidate_len} "
-         f"emit={candidate_len - emit_start}tok emitted_total={len(self.emitted_text_tokens)}\n"
-         f"  +emit   : {emit_delta!r}\n"
-         f"  pending : {pending_text!r}\n"
-         if not did_recovery else
-         f"  commit  : reset (emitted_total={len(self.emitted_text_tokens)}, carry={self.RESET_CARRY_TOKENS})\n")
-    )
+    if StreamingSession.verbose:
+      stderr_log(
+        f"chunk {self.chunk_idx}: {audio_sec:.1f}s  "
+        f"enc={enc_ms:.0f}ms prefill={prefill_ms:.0f}ms({reuse_point}kv) decode={decode_ms:.0f}ms({len(chunk_tokens)}tok)  "
+        f"win={len(self.enc_cache)}/{self.max_enc_windows} prefix={len(prefix_toks)} raw={len(self.raw_tokens)}{flags}\n"
+        f"  decoded : {decode_text!r}\n"
+        + (f"  commit  : lcp={lcp}/{candidate_len} "
+           f"emit={candidate_len - emit_start}tok emitted_total={len(self.emitted_text_tokens)}\n"
+           f"  +emit   : {emit_delta!r}\n"
+           f"  pending : {pending_text!r}\n"
+           if not did_recovery else
+           f"  commit  : reset (emitted_total={len(self.emitted_text_tokens)}, carry={self.RESET_CARRY_TOKENS})\n")
+      )
 
 # ============================================================================
 # OpenAI-compatible server with live microphone transcription
