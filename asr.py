@@ -14,7 +14,7 @@ Usage:
 Requires: tinygrad (pip install tinygrad or local -e install)
 """
 from __future__ import annotations
-import sys, os, argparse, json, time, math, wave, struct, uuid, functools, pathlib, tempfile
+import sys, os, argparse, json, time, math, wave, struct, uuid, functools, pathlib, tempfile, hashlib, base64
 import numpy as np
 
 # Windows CUDA workarounds (must run before tinygrad import):
@@ -834,18 +834,23 @@ class StreamingSession:
       self._is_final = True
       self._process_chunk()
 
-    # Build display: committed text + pending (unfixed) tail
-    text = self.emitted_text
-    # Add pending tokens (unfixed tail from latest decode)
+    # Build display: committed text + pending (unfixed rollback tail)
+    committed = self.emitted_text
+    pending_text = ""
     text_start = 0
     for i, t in enumerate(self.raw_tokens):
       if t == TOKEN_ASR_TEXT: text_start = i + 1; break
     text_tokens = self.raw_tokens[text_start:]
     if len(text_tokens) > len(self.stable_text_tokens):
-      pending = text_tokens[len(self.stable_text_tokens):]
-      text += self.model.tok.decode(pending)
+      pending_toks = text_tokens[len(self.stable_text_tokens):]
+      pending_text = self.model.tok.decode(pending_toks)
 
-    return {"text": text.strip(), "stats": self.last_stats}
+    return {
+      "text": (committed + pending_text).strip(),
+      "committed": committed.strip(),
+      "pending": pending_text,
+      "stats": self.last_stats,
+    }
 
   def _process_chunk(self):
     """Process one chunk: encoder + text prefix + prefill + decode + commit."""
@@ -1087,6 +1092,46 @@ from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 # Self-contained HTML page: microphone capture + live transcription display
 _HTML_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# ---- WebSocket protocol helpers (RFC 6455) ----
+_WS_MAGIC = b"258EAFA5-E914-47DA-95CA-5B99C7714885"
+
+def _ws_recv(rfile) -> tuple[int, bytes]:
+  """Read a complete WebSocket message (handles fragmentation). Returns (opcode, payload)."""
+  fragments = []
+  msg_opcode = None
+  while True:
+    try:
+      b = rfile.read(2)
+    except (ConnectionError, OSError):
+      return 0x8, b''
+    if not b or len(b) < 2: return 0x8, b''
+    fin = bool(b[0] & 0x80)
+    opcode = b[0] & 0xF
+    masked = bool(b[1] & 0x80)
+    length = b[1] & 0x7F
+    if length == 126: length = int.from_bytes(rfile.read(2), 'big')
+    elif length == 127: length = int.from_bytes(rfile.read(8), 'big')
+    mask = rfile.read(4) if masked else b''
+    payload = rfile.read(length) if length > 0 else b''
+    if masked and len(mask) == 4 and len(payload) > 0:
+      p = np.frombuffer(payload, dtype=np.uint8)
+      m = np.tile(np.frombuffer(mask, dtype=np.uint8), (len(p) + 3) // 4)[:len(p)]
+      payload = bytes(p ^ m)
+    # Control frames (close/ping/pong) are never fragmented
+    if opcode >= 0x8: return opcode, payload
+    if opcode != 0: msg_opcode = opcode  # text(1) or binary(2) start
+    fragments.append(payload)
+    if fin: return msg_opcode or opcode, b''.join(fragments)
+
+def _ws_send(sock, opcode: int, payload: bytes):
+  """Send one WebSocket frame (unmasked, server-to-client)."""
+  header = bytes([0x80 | opcode])
+  n = len(payload)
+  if n < 126: header += bytes([n])
+  elif n < 65536: header += bytes([126]) + n.to_bytes(2, 'big')
+  else: header += bytes([127]) + n.to_bytes(8, 'big')
+  sock.sendall(header + payload)
+
 class ASRHandler(HTTPRequestHandler):
   model: ASR  # set before serving
   session: StreamingSession | None = None  # global streaming session (single-user server)
@@ -1094,7 +1139,9 @@ class ASRHandler(HTTPRequestHandler):
   def log_request(self, code='-', size='-'): pass
 
   def do_GET(self):
-    if self.path == '/':
+    if self.path == '/ws' and 'upgrade' in self.headers.get('Connection', '').lower():
+      self._handle_ws()
+    elif self.path == '/':
       html_path = os.path.join(_HTML_DIR, 'index.html')
       try: self.send_data(open(html_path, 'rb').read(), content_type="text/html")
       except FileNotFoundError: self.send_error(404, "index.html not found")
@@ -1102,6 +1149,70 @@ class ASRHandler(HTTPRequestHandler):
     elif self.path == '/v1/models':
       self.send_data(json.dumps({"data": [{"id": "qwen3-asr", "object": "model"}]}).encode())
     else: self.send_error(404)
+
+  def _handle_ws(self):
+    """WebSocket upgrade + message loop for streaming transcription.
+
+    Protocol:
+      Client → Server:
+        Text:   {"type":"start"}           → create new session
+        Binary: Int16 LE PCM (16kHz mono)  → feed audio chunk
+        Text:   {"type":"end"}             → finalize and close
+      Server → Client:
+        Text:   {"committed":"...","pending":"...","stats":{...}}
+    """
+    key = self.headers.get('Sec-WebSocket-Key', '')
+    if not key: self.send_error(400, "Missing Sec-WebSocket-Key"); return
+    accept = base64.b64encode(hashlib.sha1(key.encode() + _WS_MAGIC).digest()).decode()
+    self.request.sendall((
+      "HTTP/1.1 101 Switching Protocols\r\n"
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+      f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    ).encode())
+    self.close_connection = True
+
+    session = None
+    sock = self.request
+    try:
+      while True:
+        opcode, payload = _ws_recv(self.rfile)
+        if opcode == 0x8:  # close
+          try: _ws_send(sock, 0x8, b'')
+          except OSError: pass
+          break
+        if opcode == 0x9:  # ping → pong
+          _ws_send(sock, 0xA, payload); continue
+
+        if opcode == 0x1:  # text message (JSON control)
+          msg = json.loads(payload)
+          if msg.get('type') == 'start':
+            session = StreamingSession(self.model)
+            ASRHandler.session = session
+            stderr_log("ws: session started\n")
+            _ws_send(sock, 0x1, json.dumps({"committed":"","pending":"","status":"started"}).encode())
+          elif msg.get('type') == 'end':
+            if session:
+              result = session.feed(np.array([], dtype=np.float32), is_final=True)
+              _ws_send(sock, 0x1, json.dumps({
+                "committed": result["committed"], "pending": "",
+                "stats": result.get("stats", {}), "status": "done",
+              }).encode())
+            ASRHandler.session = None; session = None
+            break
+
+        elif opcode == 0x2:  # binary message (Int16 PCM audio)
+          if session and len(payload) >= 2:
+            audio = np.frombuffer(payload, dtype=np.int16).astype(np.float32) / 32768.0
+            result = session.feed(audio)
+            _ws_send(sock, 0x1, json.dumps({
+              "committed": result["committed"], "pending": result["pending"],
+              "stats": result.get("stats", {}),
+            }).encode())
+    except (ConnectionError, OSError, BrokenPipeError):
+      pass
+    finally:
+      if session: ASRHandler.session = None
+      stderr_log("ws: connection closed\n")
 
   def do_POST(self):
     if self.path == '/v1/audio/transcriptions':
@@ -1177,7 +1288,7 @@ class ASRHandler(HTTPRequestHandler):
       is_final = action == 'end'
       result = ASRHandler.session.feed(audio, is_final=is_final)
 
-      resp = {"text": result["text"], "stats": result.get("stats", {})}
+      resp = {"text": result["text"], "committed": result["committed"], "pending": result["pending"], "stats": result.get("stats", {})}
       if is_final:
         ASRHandler.session = None
         resp["status"] = "done"
