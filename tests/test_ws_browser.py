@@ -28,10 +28,10 @@ class MockSession:
 
 import asr
 asr.StreamingSession = lambda model, **kw: MockSession()
-from asr import ASRHandler, start_ws_server
+from server import ServerHandler, start_ws_server
 from tinygrad.viz.serve import TCPServerWithReuse
 
-ASRHandler.model = "mock"
+ServerHandler.model = "mock"
 HTTP_PORT = 18091
 WS_PORT = HTTP_PORT + 1
 
@@ -40,11 +40,11 @@ print(f"HTTP:      http://localhost:{HTTP_PORT}", flush=True)
 print(f"WebSocket: ws://localhost:{WS_PORT}", flush=True)
 print("Ctrl+C to stop\n", flush=True)
 
-server = TCPServerWithReuse(("", HTTP_PORT), ASRHandler)
-server.daemon_threads = True
+http_server = TCPServerWithReuse(("", HTTP_PORT), ServerHandler)
+http_server.daemon_threads = True
 try:
-  server.serve_forever()
+  http_server.serve_forever()
 except KeyboardInterrupt:
   print("\nshutdown")
-  server.server_close()
+  http_server.server_close()
   ws_server.shutdown()

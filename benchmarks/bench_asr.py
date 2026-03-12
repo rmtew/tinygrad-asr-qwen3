@@ -2,11 +2,12 @@
 Benchmark ASR on LibriSpeech test-clean.
 
 Usage:
-  python bench.py [--n 50] [--model path/to/gguf] [--dataset path/to/LibriSpeech/test-clean]
+  python benchmarks/bench_asr.py [--n 50] [--model path/to/gguf] [--dataset path/to/LibriSpeech/test-clean]
 
 Reports: WER, RTF, tok/s, and per-utterance timing.
 """
-import os, time, argparse, glob, pathlib
+import sys, os, time, argparse, glob, pathlib
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault('CUDA', '1')
 os.environ.setdefault('CUDA_PTX', '1')
 

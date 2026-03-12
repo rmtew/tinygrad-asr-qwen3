@@ -1,0 +1,381 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>tinygrad Chat</title><style>
+* { margin: 0; box-sizing: border-box }
+body { background: #212121; color: #e3e3e3; font-family: system-ui;
+       height: 100vh; display: flex; flex-direction: column }
+
+/* Header */
+header { padding: 12px 20px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #333 }
+header h1 { font-size: 1em; color: #888; flex: 1 }
+header a { color: #666; text-decoration: none; font-size: 0.85em }
+header a:hover { color: #aaa }
+
+/* Server info panel */
+#server-info { padding: 6px 20px; font-size: 0.75em; color: #555;
+               display: flex; gap: 16px; flex-wrap: wrap; border-bottom: 1px solid #2a2a2a }
+#server-info .label { color: #666 }
+#server-info .val { color: #888 }
+
+/* Messages area */
+#messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px }
+.msg { max-width: 75%; padding: 10px 16px; border-radius: 16px; line-height: 1.5; font-size: 0.95em;
+       white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word }
+.msg.user { align-self: flex-end; background: #2d5a27; border-bottom-right-radius: 4px }
+.msg.assistant { align-self: flex-start; background: #2f2f2f; border-bottom-left-radius: 4px;
+                 min-width: min(75%, 400px) }
+.msg.assistant .cursor { display: inline-block; width: 2px; height: 1em; background: #888;
+                         vertical-align: text-bottom; animation: blink 0.8s step-end infinite }
+@keyframes blink { 50% { opacity: 0 } }
+.msg.error { align-self: center; background: #4a1c1c; color: #e88; font-size: 0.85em; border-radius: 8px }
+
+/* Input bar */
+#input-bar { padding: 12px 16px; border-top: 1px solid #333; display: flex; gap: 8px; align-items: flex-end }
+#text-input { flex: 1; background: #2f2f2f; color: #e3e3e3; border: 1px solid #444; border-radius: 20px;
+              padding: 10px 16px; font: inherit; font-size: 0.95em; resize: none; max-height: 120px;
+              line-height: 1.4; outline: none }
+#text-input:focus { border-color: #666 }
+#text-input::placeholder { color: #666 }
+.btn { width: 40px; height: 40px; border-radius: 50%; border: none; cursor: pointer;
+       display: flex; align-items: center; justify-content: center; flex-shrink: 0 }
+#send-btn { background: #4caf50; color: white }
+#send-btn:hover { background: #5cbf60 }
+#send-btn:disabled { background: #333; color: #666; cursor: default }
+#mic-btn { background: #2f2f2f; color: #e3e3e3 }
+#mic-btn:hover:not(:disabled) { background: #3f3f3f }
+#mic-btn:disabled { background: #333; color: #555; cursor: default }
+#mic-btn.recording { background: #c62828; color: white; animation: pulse 1.5s ease-in-out infinite }
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.7 } }
+
+/* Recording preview */
+#rec-preview { display: none; flex: 1; padding: 10px 16px; background: #2f2f2f; border: 1px solid #c62828;
+               border-radius: 20px; font-size: 0.95em; line-height: 1.4; min-height: 42px }
+#rec-preview .committed { color: #e3e3e3 }
+#rec-preview .pending { color: #777; font-style: italic }
+#rec-preview .hint { color: #555 }
+
+/* Status */
+#status { text-align: center; padding: 4px; color: #666; font-size: 0.8em; min-height: 1.4em }
+</style></head><body>
+<header>
+  <h1>tinygrad chat</h1>
+  <a href="/">ASR</a>
+</header>
+<div id="server-info"></div>
+<div id="messages"></div>
+<div id="status"></div>
+<div id="input-bar">
+  <textarea id="text-input" rows="1" placeholder="Type a message..." onkeydown="onKey(event)"
+            oninput="autoResize(this)"></textarea>
+  <div id="rec-preview"><span class="hint">Listening...</span></div>
+  <button class="btn" id="mic-btn" onclick="toggleMic()" title="Voice input">🎤</button>
+  <button class="btn" id="send-btn" onclick="sendMessage()" title="Send" disabled>▶</button>
+</div>
+<script>
+const messagesEl = document.getElementById('messages');
+const textInput = document.getElementById('text-input');
+const sendBtn = document.getElementById('send-btn');
+const micBtn = document.getElementById('mic-btn');
+const recPreview = document.getElementById('rec-preview');
+const statusEl = document.getElementById('status');
+
+let conversation = [];  // {role, content} history
+let generating = false;
+let controller = null;  // AbortController for in-flight LLM request
+
+// --- Text input ---
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+  sendBtn.disabled = !el.value.trim() && !generating;
+}
+
+function onKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+// --- Message rendering ---
+function addMessage(role, content) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = content;
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return div;
+}
+
+function scrollToBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
+
+// --- Send message + stream LLM response ---
+async function sendMessage() {
+  const text = textInput.value.trim();
+  if (!text || generating) return;
+
+  // Show user bubble
+  addMessage('user', text);
+  conversation.push({ role: 'user', content: text });
+  textInput.value = '';
+  autoResize(textInput);
+
+  // Stream LLM response
+  await streamLLM();
+}
+
+async function streamLLM() {
+  generating = true;
+  sendBtn.disabled = true;
+  textInput.disabled = true;
+  micBtn.disabled = true;
+  statusEl.textContent = '';
+
+  const assistantDiv = addMessage('assistant', '');
+  const textSpan = document.createElement('span');
+  const cursor = document.createElement('span');
+  cursor.className = 'cursor';
+  assistantDiv.textContent = '';  // clear
+  assistantDiv.appendChild(textSpan);
+  assistantDiv.appendChild(cursor);
+
+  let fullText = '';
+  controller = new AbortController();
+
+  try {
+    const resp = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'qwen3.5', stream: true, messages: conversation }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      // Process SSE lines
+      const lines = buf.split('\n');
+      buf = lines.pop();  // keep incomplete line
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') continue;
+        try {
+          const chunk = JSON.parse(data);
+          const delta = chunk.choices?.[0]?.delta?.content || '';
+          if (delta) {
+            fullText += delta;
+            // Strip <think>...</think> for display; show "Thinking..." while inside
+            const stripped = fullText.replace(/<think>[\s\S]*?<\/think>\s*/g, '').trimStart();
+            const thinking = fullText.includes('<think>') && !fullText.includes('</think>');
+            textSpan.textContent = thinking ? (stripped || 'Thinking...') : (stripped || '');
+            scrollToBottom();
+          }
+        } catch {}
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      assistantDiv.remove();
+      addMessage('error', 'Error: ' + e.message);
+    }
+  }
+
+  cursor.remove();
+  const finalText = fullText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  assistantDiv.textContent = finalText || '(empty response)';
+  if (finalText) conversation.push({ role: 'assistant', content: finalText });
+
+  generating = false;
+  sendBtn.disabled = !textInput.value.trim();
+  textInput.disabled = false;
+  micBtn.disabled = false;
+  textInput.focus();
+  controller = null;
+  statusEl.textContent = '';
+}
+
+// --- Voice input (WebSocket ASR streaming) ---
+let audioCtx, source, processor, pcmChunks, sentChunkIdx, totalSent;
+let ws = null, recording = false, sendTimer;
+
+function pcmToInt16(f32) {
+  const i16 = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) { const s = Math.max(-1, Math.min(1, f32[i])); i16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF; }
+  return i16;
+}
+
+function getDeltaPCM() {
+  const chunks = pcmChunks.slice(sentChunkIdx);
+  sentChunkIdx = pcmChunks.length;
+  let len = 0; for (const c of chunks) len += c.length;
+  const out = new Float32Array(len);
+  let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
+  totalSent += len;
+  return out;
+}
+
+let lastTranscript = '';
+
+async function toggleMic() {
+  if (recording) { stopRecording(); return; }
+  if (generating) return;
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true }
+    });
+    audioCtx = new AudioContext({ sampleRate: 16000 });
+    source = audioCtx.createMediaStreamSource(stream);
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    pcmChunks = []; sentChunkIdx = 0; totalSent = 0; lastTranscript = '';
+    let silentChunks = 0, muteWarned = false;
+
+    processor.onaudioprocess = e => {
+      const data = e.inputBuffer.getChannelData(0);
+      pcmChunks.push(new Float32Array(data));
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+      const rms = Math.sqrt(sum / data.length);
+      if (rms < 0.001) { silentChunks++; } else { silentChunks = 0; muteWarned = false; }
+      if (silentChunks >= 12 && !muteWarned) {
+        muteWarned = true;
+        recPreview.innerHTML = '<span class="hint" style="color:#f44336">No audio — is your microphone muted?</span>';
+      }
+    };
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+
+    // Switch UI to recording mode
+    textInput.style.display = 'none';
+    recPreview.style.display = 'block';
+    recPreview.innerHTML = '<span class="hint">Listening...</span>';
+    micBtn.classList.add('recording');
+    micBtn.title = 'Stop recording';
+    sendBtn.disabled = true;
+
+    // Open WebSocket
+    const wsPort = parseInt(location.port || '8090') + 1;
+    const sock = new WebSocket(`ws://${location.hostname}:${wsPort}`);
+    sock.binaryType = 'arraybuffer';
+    ws = sock;
+    sock.onopen = () => {
+      sock.send(JSON.stringify({ type: 'start' }));
+      sendTimer = setInterval(() => {
+        if (!sock || sock.readyState !== WebSocket.OPEN) return;
+        const delta = getDeltaPCM();
+        if (delta.length > 0) sock.send(pcmToInt16(delta).buffer);
+      }, 2000);
+    };
+    sock.onmessage = e => {
+      const d = JSON.parse(e.data);
+      const committed = d.committed || '';
+      const pending = d.pending || '';
+      lastTranscript = committed + pending;
+      if (committed || pending) {
+        recPreview.innerHTML = `<span class="committed">${esc(committed)}</span><span class="pending">${esc(pending)}</span>`;
+      } else {
+        recPreview.innerHTML = '<span class="hint">Listening...</span>';
+      }
+    };
+    sock.onerror = () => { statusEl.textContent = 'WebSocket error'; };
+    sock.onclose = () => { if (ws === sock) ws = null; };
+    recording = true;
+  } catch (e) { statusEl.textContent = 'Mic error: ' + e.message; }
+}
+
+function stopRecording() {
+  clearInterval(sendTimer);
+  processor.disconnect(); source.disconnect();
+  source.mediaStream.getTracks().forEach(t => t.stop());
+  audioCtx.close();
+  recording = false;
+  recPreview.innerHTML = '<span class="hint">Finalizing...</span>';
+
+  // Send remaining audio + finalize
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const delta = getDeltaPCM();
+    if (delta.length > 0) ws.send(pcmToInt16(delta).buffer);
+    ws.send(JSON.stringify({ type: 'end' }));
+  }
+
+  let finalized = false;
+  const finalize = () => {
+    if (finalized) return;
+    finalized = true;
+    // Restore UI
+    textInput.style.display = '';
+    recPreview.style.display = 'none';
+    micBtn.classList.remove('recording');
+    micBtn.title = 'Voice input';
+
+    const text = lastTranscript.trim();
+    if (text) {
+      addMessage('user', text);
+      conversation.push({ role: 'user', content: text });
+      streamLLM();
+    }
+  };
+
+  // Wait for server's 'done' response (no timeout — server always sends it)
+  if (ws) {
+    const origHandler = ws.onmessage;
+    ws.onmessage = e => {
+      origHandler(e);
+      const d = JSON.parse(e.data);
+      if (d.status === 'done') finalize();
+    };
+  } else {
+    finalize();
+  }
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// Server stats
+const serverInfoEl = document.getElementById('server-info');
+function si(label, value) { return `<span class="label">${label}</span> <span class="val">${value}</span>`; }
+function fmtMB(mb) { return mb >= 1024 ? (mb/1024).toFixed(1) + ' GB' : mb + ' MB'; }
+let serverOnline = false;
+function renderStats(d) {
+  const parts = [];
+  const gpu = d.gpu_name || d.backend || '?';
+  parts.push(si('device', gpu + (d.arch ? ' (' + d.arch + ')' : '')));
+  const models = d.models || {};
+  const names = Object.entries(models).map(([k,v]) => {
+    const short = v.includes('/') || v.includes('\\') ? v.split(/[/\\]/).pop() : v;
+    return k.toUpperCase() + ': ' + short;
+  });
+  if (names.length) parts.push(si('models', names.join(', ')));
+  if (d.tinygrad_mem_mb != null) {
+    let mem = 'tinygrad ' + fmtMB(d.tinygrad_mem_mb);
+    if (d.vram_total_mb) mem += ' / ' + fmtMB(d.vram_total_mb) + ' VRAM';
+    if (d.vram_free_mb != null) mem += ' (' + fmtMB(d.vram_free_mb) + ' free)';
+    parts.push(si('mem', mem));
+  }
+  if (d.ram_total_mb) parts.push(si('RAM', fmtMB(d.ram_used_mb) + ' / ' + fmtMB(d.ram_total_mb)));
+  return parts.join('');
+}
+async function fetchServerInfo() {
+  try {
+    const r = await fetch('/v1/stats');
+    const d = await r.json();
+    serverOnline = true;
+    serverInfoEl.style.borderColor = '#2a2a2a';
+    serverInfoEl.innerHTML = renderStats(d);
+  } catch(e) {
+    if (serverOnline || !serverInfoEl.innerHTML) {
+      serverOnline = false;
+      serverInfoEl.style.borderColor = '#4a1c1c';
+      serverInfoEl.innerHTML = si('status', '<span style="color:#f44336">server offline</span>') +
+        (serverInfoEl.innerHTML ? ' ' + serverInfoEl.innerHTML.replace(/>mem /g, '>last mem ') : '');
+    }
+  }
+}
+fetchServerInfo();
+setInterval(fetchServerInfo, 10000);
+</script></body></html>

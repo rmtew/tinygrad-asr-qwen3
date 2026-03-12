@@ -5,11 +5,12 @@ Grid-searches (chunk_sec, rollback) pairs on captured audio,
 reports WER for each combo vs per-file reference.
 
 Usage:
-  py sweep_params.py captures/session_*.wav
-  py sweep_params.py --chunks 2,3,4,6,8 --rollbacks 3,4,5,6 captures/*.wav
-  py sweep_params.py --all-audio   # use captures/ + known test files
+  python benchmarks/sweep_params.py captures/session_*.wav
+  python benchmarks/sweep_params.py --chunks 2,3,4,6,8 --rollbacks 3,4,5,6 captures/*.wav
+  python benchmarks/sweep_params.py --all-audio   # use captures/ + known test files
 """
 import sys, os, time, argparse, glob
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("CUDA", "1")
 os.environ.setdefault("CUDA_PTX", "1")
 

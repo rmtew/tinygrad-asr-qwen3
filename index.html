@@ -1,4 +1,4 @@
-<!DOCTYPE html><html><head><title>tinygrad ASR</title><style>
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>tinygrad ASR</title><style>
   * { margin: 0; box-sizing: border-box }
   body { background: #212121; color: #e3e3e3; font-family: system-ui;
          height: 100vh; display: flex; flex-direction: column; align-items: center }
@@ -17,6 +17,12 @@
   #drop { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none;
           align-items: center; justify-content: center; font-size: 2em; color: #aaa; z-index: 10 }
 
+  /* Server info panel */
+  #server-info { max-width: 768px; width: 100%; padding: 8px 20px; font-size: 0.75em; color: #555;
+                 display: flex; gap: 16px; flex-wrap: wrap; border-bottom: 1px solid #2a2a2a }
+  #server-info .label { color: #666 }
+  #server-info .val { color: #888 }
+
   /* Stats panel */
   #stats { max-width: 768px; width: 100%; padding: 0 20px 16px; display: none; font-size: 0.8em }
   #level-wrap { height: 4px; background: #333; border-radius: 2px; margin-bottom: 8px; overflow: hidden }
@@ -26,7 +32,8 @@
   #stat-detail { display: flex; gap: 16px; color: #555; margin-top: 4px; flex-wrap: wrap }
   #stat-detail .val { color: #777 }
 </style></head><body>
-<h1>tinygrad qwen3-asr</h1>
+<h1>tinygrad qwen3-asr &nbsp;<a href="/chat" style="color:#555;font-size:0.8em;text-decoration:none">chat &rarr;</a></h1>
+<div id="server-info"></div>
 <div id="transcript"><span id="committed"></span><span id="pending"></span><span id="placeholder">Click Record or drop an audio file</span></div>
 <div id="controls">
   <button id="mic" onclick="toggleMic()">Record</button>
@@ -51,6 +58,7 @@ const pendingEl = document.getElementById('pending');
 const placeholderEl = document.getElementById('placeholder');
 let audioCtx, source, processor, pcmChunks, recording = false, sendTimer;
 let ws = null, sentChunkIdx = 0, totalSent = 0;
+let silentChunks = 0, muteWarned = false;
 
 function setTranscript(committed, pending) {
   committedEl.textContent = committed || '';
@@ -123,6 +131,7 @@ async function toggleMic() {
     source = audioCtx.createMediaStreamSource(stream);
     processor = audioCtx.createScriptProcessor(4096, 1, 1);
     pcmChunks = []; sentChunkIdx = 0; totalSent = 0;
+    silentChunks = 0; muteWarned = false;
     processor.onaudioprocess = e => {
       const data = e.inputBuffer.getChannelData(0);
       pcmChunks.push(new Float32Array(data));
@@ -132,26 +141,36 @@ async function toggleMic() {
       const pct = Math.min(100, (rms / 0.15) * 100);
       levelEl.style.width = pct + '%';
       levelEl.style.background = pct > 60 ? '#ff9800' : '#4caf50';
+      // Mute detection: ~3s of silence at 16kHz/4096 = ~12 chunks
+      if (rms < 0.001) { silentChunks++; } else { silentChunks = 0; muteWarned = false; }
+      if (silentChunks >= 12 && !muteWarned) {
+        muteWarned = true;
+        S.textContent = 'No audio — is your microphone muted?';
+        S.style.color = '#f44336';
+      } else if (!muteWarned && recording) {
+        S.style.color = '#888';
+      }
     };
     source.connect(processor);
     processor.connect(audioCtx.destination);
 
     // Open WebSocket (runs on HTTP port + 1)
     const wsPort = parseInt(location.port || '8090') + 1;
-    ws = new WebSocket(`ws://${location.hostname}:${wsPort}`);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => {
-      ws.send(JSON.stringify({type: 'start'}));
+    const sock = new WebSocket(`ws://${location.hostname}:${wsPort}`);
+    sock.binaryType = 'arraybuffer';
+    ws = sock;
+    sock.onopen = () => {
+      sock.send(JSON.stringify({type: 'start'}));
       sendTimer = setInterval(sendChunk, 2000);
     };
-    ws.onmessage = e => {
+    sock.onmessage = e => {
       const d = JSON.parse(e.data);
       setTranscript(d.committed, d.pending);
       if (d.stats) updateStats(d.stats);
       if (d.status === 'done') S.textContent = '';
     };
-    ws.onerror = () => { S.textContent = 'WebSocket error'; };
-    ws.onclose = () => { ws = null; };
+    sock.onerror = () => { S.textContent = 'WebSocket error'; };
+    sock.onclose = () => { if (ws === sock) ws = null; };
 
     recording = true;
     document.getElementById('mic').textContent = 'Stop';
@@ -200,4 +219,47 @@ document.addEventListener('drop', e => {
   e.preventDefault(); document.getElementById('drop').style.display = 'none';
   if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
 });
+
+// Server stats
+const serverInfoEl = document.getElementById('server-info');
+function si(label, value) { return `<span class="label">${label}</span> <span class="val">${value}</span>`; }
+function fmtMB(mb) { return mb >= 1024 ? (mb/1024).toFixed(1) + ' GB' : mb + ' MB'; }
+let serverOnline = false;
+function renderStats(d) {
+  const parts = [];
+  const gpu = d.gpu_name || d.backend || '?';
+  parts.push(si('device', gpu + (d.arch ? ' (' + d.arch + ')' : '')));
+  const models = d.models || {};
+  const names = Object.entries(models).map(([k,v]) => {
+    const short = v.includes('/') || v.includes('\\') ? v.split(/[/\\]/).pop() : v;
+    return k.toUpperCase() + ': ' + short;
+  });
+  if (names.length) parts.push(si('models', names.join(', ')));
+  if (d.tinygrad_mem_mb != null) {
+    let mem = 'tinygrad ' + fmtMB(d.tinygrad_mem_mb);
+    if (d.vram_total_mb) mem += ' / ' + fmtMB(d.vram_total_mb) + ' VRAM';
+    if (d.vram_free_mb != null) mem += ' (' + fmtMB(d.vram_free_mb) + ' free)';
+    parts.push(si('mem', mem));
+  }
+  if (d.ram_total_mb) parts.push(si('RAM', fmtMB(d.ram_used_mb) + ' / ' + fmtMB(d.ram_total_mb)));
+  return parts.join('');
+}
+async function fetchServerInfo() {
+  try {
+    const r = await fetch('/v1/stats');
+    const d = await r.json();
+    serverOnline = true;
+    serverInfoEl.style.borderColor = '#2a2a2a';
+    serverInfoEl.innerHTML = renderStats(d);
+  } catch(e) {
+    if (serverOnline || !serverInfoEl.innerHTML) {
+      serverOnline = false;
+      serverInfoEl.style.borderColor = '#4a1c1c';
+      serverInfoEl.innerHTML = si('status', '<span style="color:#f44336">server offline</span>') +
+        (serverInfoEl.innerHTML ? ' ' + serverInfoEl.innerHTML.replace(/>mem /g, '>last mem ') : '');
+    }
+  }
+}
+fetchServerInfo();
+setInterval(fetchServerInfo, 10000);
 </script></body></html>

@@ -1,16 +1,17 @@
 # tinygrad-asr-qwen3
 
-Qwen3-ASR speech recognition via [tinygrad](https://github.com/tinygrad/tinygrad). Single-file implementation with OpenAI-compatible API and browser-based microphone transcription.
+Speech recognition and LLM chat via [tinygrad](https://github.com/tinygrad/tinygrad). Single-file implementation with OpenAI-compatible API and browser-based UIs.
 
 ## Features
 
+- **ASR** — Qwen3-ASR 0.6B with live microphone streaming, file transcription
+- **LLM** — Qwen3.5 chat (0.8B–9B) with streaming SSE responses
+- **Voice + text chat UI** — record voice → ASR transcription → LLM response
 - Loads GGUF models (F16/F32) via tinygrad's built-in `gguf_load`
-- Reuses tinygrad's `Transformer` for the decoder — no duplicated code
-- OpenAI-compatible `/v1/audio/transcriptions` endpoint
-- Web UI with live microphone transcription (WebSocket), file drag-and-drop
-- Committed/pending confidence display — stable text vs. provisional rollback tail
-- Streaming with text prefix feedback, rollback commit, stagnation recovery
-- Browser noise suppression (WebRTC `noiseSuppression`, `echoCancellation`, `autoGainControl`)
+- Reuses tinygrad's `Transformer` for ASR decoder and LLM — no duplicated code
+- OpenAI-compatible `/v1/audio/transcriptions` and `/v1/chat/completions`
+- WebSocket streaming with committed/pending confidence display
+- Dispatch queue for thread-safe multi-model GPU inference
 - GPU accelerated (CUDA, etc.)
 
 ## Install
@@ -52,17 +53,28 @@ python asr.py --model model.gguf
 ### Server + Web UI
 
 ```bash
-# Start on default port 8090
+# ASR only
 python asr.py --model model.gguf --serve
+
+# ASR + LLM chat
+python asr.py --model model.gguf --llm-model Qwen3.5-0.8B-Q4_K_M.gguf --serve
 
 # Custom port
 python asr.py --model model.gguf --serve 9000
 ```
 
-Open `http://localhost:8090` in your browser to get the transcription UI:
+Open `http://localhost:8090` for the ASR UI, or `http://localhost:8090/chat` for the chat UI:
+
+**ASR page (`/`):**
 - **Record** — click to start/stop microphone recording. Audio streams to the server over WebSocket. Transcription updates live every 2 seconds. Committed text appears in white; the provisional rollback tail appears in dim italic.
 - **Upload file** — or drag-and-drop an audio file onto the page for one-shot transcription.
 - **Stats panel** — shows RTF, latency breakdown (encoder/prefill/decode), encoder windows, KV cache reuse, committed/pending token counts.
+
+**Chat page (`/chat`):**
+- **Text input** — type a message and press Enter (or click send).
+- **Voice input** — click 🎤 to record, click again to stop. Live ASR preview shows committed/pending text. On stop, the transcript is sent to the LLM automatically.
+- **Streaming responses** — LLM tokens appear in real-time. `<think>` tags are stripped from display.
+- Mic and send buttons are disabled during LLM generation to prevent concurrent inference.
 
 ### API
 
@@ -155,9 +167,47 @@ CUDA=1 BEAM=2 python sweep_params.py captures/*.wav
 
 ## Models
 
-| Model | Size | Source |
-|-------|------|--------|
-| `qwen3-asr:0.6b` | 1.88 GB | [FlippyDora/qwen3-asr-0.6b-GGUF](https://huggingface.co/FlippyDora/qwen3-asr-0.6b-GGUF) |
+| Model | Size | Format | Source |
+|-------|------|--------|--------|
+| `qwen3-asr:0.6b` | 1.88 GB | GGUF (F16) | [FlippyDora/qwen3-asr-0.6b-GGUF](https://huggingface.co/FlippyDora/qwen3-asr-0.6b-GGUF) |
+| Qwen3-TTS 0.6B CustomVoice | 1.73 GB | GGUF (F16) | Convert with `tools/convert_tts_gguf.py` from [Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice) |
+| Qwen3-TTS Vocoder | 651 MB | safetensors (F32) | Ships with Qwen3-TTS as `Qwen3-TTS-Tokenizer-12Hz/` |
+
+## TTS
+
+Qwen3-TTS 0.6B text-to-speech with 9 built-in voices. Uses CustomVoice model (named voices via `spk_id`). Loads talker weights from F16 GGUF (converted from safetensors).
+
+### Setup
+
+```bash
+# Download CustomVoice model + vocoder from HuggingFace, then convert to GGUF:
+python tools/convert_tts_gguf.py path/to/qwen3-tts-12hz-0.6b-customvoice
+# Produces qwen3-tts-0b6-custom_voice-f16.gguf (1.73 GB) in the model directory
+# Vocoder (Qwen3-TTS-Tokenizer-12Hz/) must be a sibling directory
+```
+
+### Voices
+
+`serena`, `vivian`, `uncle_fu`, `ryan`, `aiden`, `ono_anna`, `sohee`, `eric`, `dylan`
+
+### Pipeline
+
+```
+Text → BPE tokenize → interleaved text+codec prefix embeddings (+voice embedding)
+  → Talker LM (28-layer Qwen3, KV cache, top-k sampling) → codec tokens
+  → Code Predictor (5-layer, 15 sub-codebook tokens per step)
+  → Vocoder (BigVGAN: RVQ → pre-transformer → upsample → 24kHz audio)
+```
+
+### Performance (no JITBEAM, RTX 3070 Ti Laptop)
+
+| Text | Steps | Audio | RTF | C ref RTF |
+|------|-------|-------|-----|-----------|
+| Short (2 words) | 13 | 1.0s | 8.6 | ~1.7 |
+| Medium (9 words) | 44 | 3.5s | 4.1 | ~1.7 |
+| Long (20 words) | 92 | 7.4s | 3.1 | ~1.7 |
+
+JITBEAM=2 should close the RTF gap significantly.
 
 ## Architecture
 

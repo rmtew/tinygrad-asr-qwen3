@@ -1,19 +1,17 @@
-"""
-Qwen3-ASR inference via tinygrad with OpenAI-compatible API.
+"""Qwen3-ASR inference engine via tinygrad.
 
-Loads a Qwen3-ASR GGUF model and serves /v1/audio/transcriptions.
+Loads a Qwen3-ASR GGUF model for speech-to-text transcription.
 Reuses tinygrad's Transformer (llm.py) for the decoder — the ASR decoder
 is architecturally identical to Qwen3's text LM.
 
 Usage:
-  python asr.py                          # interactive mode
-  python asr.py --serve                  # OpenAI API server on port 8090
-  python asr.py --serve 9000             # custom port
-  python asr.py --model qwen3-asr:0.6b   # specific model
+  python asr.py --model qwen3-asr:0.6b recording.wav   # transcribe file
+  python asr.py --model qwen3-asr:0.6b                 # interactive mode
+  python server.py --model qwen3-asr:0.6b              # API server
 
 Requires: tinygrad (pip install tinygrad or local -e install)
 """
-import sys, os, argparse, json, time, math, wave, functools, pathlib, tempfile
+import sys, os, argparse, json, time, math, wave, functools, pathlib
 import numpy as np
 
 # Windows CUDA workarounds (must run before tinygrad import):
@@ -780,7 +778,6 @@ class StreamingSession:
         prefix_toks = prefix_toks[-self.max_prefix_tokens:]
 
     # --- Build prompt: [system prefix] [encoder output] [suffix] [text prefix tokens] ---
-    t_pf = time.time()
     parts = [model._prefix_embeds, audio_embeds, model._suffix_embeds]
     if prefix_toks:
       tok_ids = Tensor([prefix_toks])
@@ -791,6 +788,8 @@ class StreamingSession:
     assert prompt_len <= model._embed_buf.shape[1], f"prompt_len {prompt_len} > max_context"
 
     model._embed_buf[:, :prompt_len].assign(combined.contiguous()).realize()
+    t_embed = time.time()
+
     cur_embeds = model._embed_buf[0, :prompt_len].numpy()
 
     # KV cache reuse: find longest matching prefix with previous chunk
@@ -800,6 +799,7 @@ class StreamingSession:
       for i in range(cmp_len):
         if not np.array_equal(cur_embeds[i], self.prev_embeds[i]): break
         reuse_point = i + 1
+    t_kvcmp = time.time()
 
     delta = prompt_len - reuse_point
     if delta > 0:
@@ -810,11 +810,12 @@ class StreamingSession:
       sp_b, nt_b = model.v_sp.bind(0), model.v_nt.bind(prompt_len)
       out = model.decoder.prefill_embed_jit(model._embed_buf[:, sp_b:sp_b+nt_b], sp_b).realize()
       token = int(out.item())
+    t_xfmr = time.time()
 
     self.prev_embeds = cur_embeds.copy()
     self.prev_prompt_len = prompt_len
     self.total_reused += reuse_point
-    prefill_ms = (time.time() - t_pf) * 1000
+    prefill_ms = (t_xfmr - t0) * 1000 - enc_ms
 
     # --- Decode (continuation after prefix) ---
     t_dec = time.time()
@@ -829,7 +830,8 @@ class StreamingSession:
     else:
       if token not in EOS_TOKEN_IDS: self.hit_max_new = True
     while chunk_tokens and chunk_tokens[-1] in EOS_TOKEN_IDS: chunk_tokens.pop()
-    decode_ms = (time.time() - t_dec) * 1000
+    t_decoded = time.time()
+    decode_ms = (t_decoded - t_dec) * 1000
 
     # --- Repeat suppression: filter runs > MAX_REPEAT_TOKEN_RUN ---
     chunk_tokens, dropped_repeats = self._suppress_repeats(chunk_tokens)
@@ -957,9 +959,11 @@ class StreamingSession:
     if did_periodic: flags += " !PERIODIC_RESET"
     if dropped_repeats: flags += f" dropped={dropped_repeats}"
     if StreamingSession.verbose:
+
       stderr_log(
         f"chunk {self.chunk_idx}: {audio_sec:.1f}s  "
-        f"enc={enc_ms:.0f}ms prefill={prefill_ms:.0f}ms({reuse_point}kv) decode={decode_ms:.0f}ms({len(chunk_tokens)}tok)  "
+        f"+{(t_embed-t0)*1000:.0f}ms enc  +{(t_kvcmp-t0)*1000:.0f}ms kvcmp  +{(t_xfmr-t0)*1000:.0f}ms prefill(delta={delta}/{prompt_len})  "
+        f"+{(t_decoded-t0)*1000:.0f}ms done({len(chunk_tokens)}tok)  "
         f"win={len(self.enc_cache)}/{self.max_enc_windows} prefix={len(prefix_toks)} raw={len(self.raw_tokens)}{flags}\n"
         f"  decoded : {decode_text!r}\n"
         + (f"  commit  : lcp={lcp}/{candidate_len} "
@@ -971,184 +975,6 @@ class StreamingSession:
       )
 
 # ============================================================================
-# OpenAI-compatible server with live microphone transcription
-# ============================================================================
-
-from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
-
-# Self-contained HTML page: microphone capture + live transcription display
-_HTML_DIR = os.path.dirname(os.path.abspath(__file__))
-
-class ASRHandler(HTTPRequestHandler):
-  model: ASR  # set before serving
-  save_audio_dir: str | None = None  # --save-audio directory
-
-  def log_request(self, code='-', size='-'): pass
-
-  def do_GET(self):
-    if self.path == '/':
-      html_path = os.path.join(_HTML_DIR, 'index.html')
-      try: self.send_data(open(html_path, 'rb').read(), content_type="text/html")
-      except FileNotFoundError: self.send_error(404, "index.html not found")
-    elif self.path == '/health': self.send_data(b'{"status":"ok"}')
-    elif self.path == '/v1/models':
-      self.send_data(json.dumps({"data": [{"id": "qwen3-asr", "object": "model"}]}).encode())
-    elif self.path == '/favicon.ico': self.send_data(b'', content_type="image/x-icon")
-    else: self.send_error(404)
-
-  def do_POST(self):
-    if self.path == '/v1/audio/transcriptions':
-      self._handle_transcribe()
-    else:
-      self.send_error(404)
-
-  def _handle_transcribe(self):
-    """One-shot file transcription (stateless, per-file mode)."""
-    body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
-    content_type = self.headers.get('Content-Type', '')
-    audio_data, filename = self._extract_audio(body, content_type)
-    if audio_data is None:
-      self.send_error(400, "No audio file found"); return
-
-    suffix = os.path.splitext(filename)[1] if filename else '.bin'
-    if not suffix or suffix == '.': suffix = '.wav'
-
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-      f.write(audio_data)
-      tmp_path = f.name
-    try:
-      result = self.model.transcribe(tmp_path)
-      self.send_data(json.dumps({"text": result["text"]}).encode())
-    except Exception as e:
-      self.send_data(json.dumps({"error": str(e)}).encode(), status_code=500)
-    finally:
-      os.unlink(tmp_path)
-
-  def _extract_audio(self, body: bytes, content_type: str) -> tuple[bytes | None, str]:
-    """Extract audio bytes and filename from multipart/form-data or raw body."""
-    if 'multipart/form-data' not in content_type:
-      return body, ''
-
-    # Find boundary
-    boundary = None
-    for ct_part in content_type.split(';'):
-      ct_part = ct_part.strip()
-      if ct_part.startswith('boundary='):
-        boundary = ct_part[9:].strip('"').encode()
-    if boundary is None: return None, ''
-
-    # Find file part
-    for part in body.split(b'--' + boundary):
-      if b'name="file"' not in part and b'name="audio"' not in part: continue
-      # Extract filename from Content-Disposition
-      filename = ''
-      for line in part.split(b'\r\n'):
-        if b'filename=' in line:
-          fn = line.split(b'filename=')[1].split(b';')[0].strip(b' "\'')
-          filename = fn.decode(errors='replace')
-      # Extract body after blank line
-      idx = part.find(b'\r\n\r\n')
-      if idx < 0: continue
-      data = part[idx + 4:]
-      if data.endswith(b'\r\n'): data = data[:-2]
-      if data.endswith(b'--'): data = data[:-2]
-      if data.endswith(b'\r\n'): data = data[:-2]
-      return data, filename
-    return None, ''
-
-# ============================================================================
-# WebSocket server (via `websockets` library, separate port)
-# ============================================================================
-
-def _save_session_audio(chunks: list[np.ndarray], save_dir: str | None):
-  """Save accumulated session audio to WAV if save_dir is set."""
-  if not save_dir or not chunks: return
-  try:
-    audio = np.concatenate(chunks)
-    if len(audio) == 0: return
-    os.makedirs(save_dir, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(save_dir, f"session_{ts}.wav")
-    int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
-    with wave.open(path, 'wb') as wf:
-      wf.setnchannels(1)
-      wf.setsampwidth(2)
-      wf.setframerate(SAMPLE_RATE)
-      wf.writeframes(int16.tobytes())
-    stderr_log(f"saved {len(audio)/SAMPLE_RATE:.1f}s audio to {path}\n")
-  except Exception as e:
-    stderr_log(f"save-audio error: {e}\n")
-
-def start_ws_server(model: ASR, port: int, save_audio_dir: str | None = None, run_in_background: bool = True):
-  """Start WebSocket server on a separate port using the `websockets` library.
-
-  Protocol:
-    Client -> Server:
-      Text:   {"type":"start"}           -> create session
-      Binary: Int16 LE PCM (16kHz mono)  -> feed audio chunk
-      Text:   {"type":"end"}             -> finalize
-    Server -> Client:
-      Text:   {"committed":"...","pending":"...","stats":{...}}
-  """
-  import asyncio, threading
-  from websockets.asyncio.server import serve
-
-  async def ws_handler(ws):
-    session = None
-    audio_chunks: list[np.ndarray] = []
-    try:
-      async for message in ws:
-        if isinstance(message, str):
-          msg = json.loads(message)
-          if msg.get('type') == 'start':
-            session = StreamingSession(model)
-            audio_chunks = []
-            stderr_log("ws: session started\n")
-            await ws.send(json.dumps({"committed": "", "pending": "", "status": "started"}))
-          elif msg.get('type') == 'end':
-            if session:
-              result = session.feed(np.array([], dtype=np.float32), is_final=True)
-              await ws.send(json.dumps({
-                "committed": result["text"], "pending": "",
-                "stats": result.get("stats", {}), "status": "done",
-              }))
-            break
-        elif isinstance(message, bytes) and session and len(message) >= 2:
-          audio = np.frombuffer(message, dtype=np.int16).astype(np.float32) / 32768.0
-          audio_chunks.append(audio)
-          result = session.feed(audio)
-          await ws.send(json.dumps({
-            "committed": result["committed"], "pending": result["pending"],
-            "stats": result.get("stats", {}),
-          }))
-    except Exception as e:
-      stderr_log(f"ws: error: {type(e).__name__}: {e}\n")
-    finally:
-      _save_session_audio(audio_chunks, save_audio_dir)
-      stderr_log("ws: connection closed\n")
-
-  async def run_forever():
-    async with serve(ws_handler, "0.0.0.0", port) as server:
-      await server.serve_forever()
-
-  async def run_until_sigint():
-    stop = asyncio.Event()
-    import signal
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    async with serve(ws_handler, "0.0.0.0", port):
-      await stop.wait()
-
-  if run_in_background:
-    loop = asyncio.new_event_loop()
-    t = threading.Thread(target=loop.run_until_complete, args=(run_forever(),), daemon=True)
-    t.start()
-    class _Shutdown:
-      def shutdown(self): loop.call_soon_threadsafe(loop.stop)
-    return _Shutdown()
-  else:
-    asyncio.run(run_until_sigint())
-
-# ============================================================================
 # Model registry and CLI
 # ============================================================================
 
@@ -1156,11 +982,15 @@ KNOWN_MODELS = {
   "qwen3-asr:0.6b": "https://huggingface.co/FlippyDora/qwen3-asr-0.6b-GGUF/resolve/main/qwen3-asr-0.6b-f16.gguf",
 }
 
+KNOWN_LLM_MODELS = {
+  "qwen3.5:0.8b": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
+  "qwen3:0.6b": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+  "qwen3:1.7b": "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
+}
+
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(description="Qwen3-ASR inference via tinygrad")
-  parser.add_argument("--model", "-m", required=True, help="Path to GGUF file, or model name to download (e.g. qwen3-asr:0.6b)")
-  parser.add_argument("--serve", nargs='?', type=int, const=8090, metavar="PORT", help="Run OpenAI-compatible API server")
-  parser.add_argument("--save-audio", metavar="DIR", help="Save streaming session audio to WAV files in DIR")
+  parser.add_argument("--model", "-m", required=True, help="Path to GGUF file, or model name (e.g. qwen3-asr:0.6b)")
   parser.add_argument("audio", nargs='?', help="WAV file to transcribe (omit for interactive mode)")
   args = parser.parse_args()
 
@@ -1181,23 +1011,7 @@ if __name__ == "__main__":
   del raw
   import gc; gc.collect()
 
-  if args.serve:
-    model.warmup()
-    ASRHandler.model = model
-    ASRHandler.save_audio_dir = args.save_audio
-    ws_port = args.serve + 1
-    # HTTP in background thread (stateless endpoints)
-    http_server = TCPServerWithReuse(('', args.serve), ASRHandler)
-    http_server.daemon_threads = True
-    import threading
-    http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
-    http_thread.start()
-    stderr_log(f"open http://localhost:{args.serve} for microphone transcription\n")
-    stderr_log(f"websocket on ws://localhost:{ws_port}\n")
-    # WS in main thread — tinygrad's SQLite cache is thread-local
-    start_ws_server(model, ws_port, args.save_audio, run_in_background=False)
-    stderr_log("shutting down\n"); http_server.server_close()
-  elif args.audio:
+  if args.audio:
     result = model.transcribe(args.audio)
     print(result["text"])
   else:

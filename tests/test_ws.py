@@ -24,9 +24,10 @@ class MockSession:
                 "committed": 10, "pending": 3, "prefix_fed": 5},
     }
 
-# Patch before importing asr
+# Patch before importing server
 import asr
 asr.StreamingSession = lambda model, **kw: MockSession()
+from server import start_ws_server
 
 PORT = 18092
 
@@ -34,7 +35,7 @@ async def run_tests():
   from websockets.asyncio.client import connect
 
   # Start server
-  server = asr.start_ws_server("mock", PORT)
+  ws_server = start_ws_server("mock", PORT)
   await asyncio.sleep(0.5)
 
   try:
@@ -96,7 +97,7 @@ async def run_tests():
 
     print("\nAll tests passed!")
   finally:
-    server.shutdown()
+    ws_server.shutdown()
 
 if __name__ == "__main__":
   asyncio.run(run_tests())

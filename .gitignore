@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
 *.gguf
-asr_new.py
+*.wav
+*.txt
 captures/
+.claude/
+cache.db
